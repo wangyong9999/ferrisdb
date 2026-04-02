@@ -162,7 +162,23 @@ impl Engine {
 
     // ==================== 表管理 ====================
 
-    /// 创建表，返回 table OID
+    // ==================== 表空间管理 ====================
+
+    /// 创建表空间（路径名编码在 name 中：`ts_name::/path/to/dir`）
+    pub fn create_tablespace(&self, name: &str, _path: &str) -> Result<u32> {
+        // 表空间用 RelationType::System + name 前缀 "ts:" 标识
+        let ts_name = format!("ts:{}", name);
+        self.catalog.create_table(&ts_name, 0) // 复用 create_table 存储
+    }
+
+    /// 创建表（指定表空间，0 = 默认）
+    pub fn create_table_in(&self, name: &str, tablespace_id: u32) -> Result<u32> {
+        self.catalog.create_table(name, tablespace_id)
+    }
+
+    // ==================== 表管理 ====================
+
+    /// 创建表（默认表空间），返回 table OID
     pub fn create_table(&self, name: &str) -> Result<u32> {
         self.catalog.create_table(name, 0)
     }
@@ -190,14 +206,20 @@ impl Engine {
         if meta.current_pages > 0 {
             table.set_current_page(meta.current_pages);
         }
+        // 加载持久化的 FSM
+        let fsm_path = self.data_dir.join(format!("fsm_{}", meta.oid));
+        let _ = table.load_fsm(&fsm_path);
         Ok(table)
     }
 
-    /// 保存表的当前页面计数到 catalog（调用者在 DML 后或 shutdown 前调用）
+    /// 保存表状态到 catalog + FSM 到磁盘
     pub fn save_table_state(&self, name: &str, table: &ferrisdb_transaction::HeapTable) -> Result<()> {
         let meta = self.catalog.lookup_by_name(name)
             .ok_or_else(|| FerrisDBError::NotFound(format!("Table '{}' not found", name)))?;
-        self.catalog.update_pages(meta.oid, table.get_current_page(), meta.root_page)
+        self.catalog.update_pages(meta.oid, table.get_current_page(), meta.root_page)?;
+        let fsm_path = self.data_dir.join(format!("fsm_{}", meta.oid));
+        table.save_fsm(&fsm_path)?;
+        Ok(())
     }
 
     // ==================== 事务 ====================

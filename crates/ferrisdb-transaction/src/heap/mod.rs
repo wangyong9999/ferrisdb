@@ -176,6 +176,36 @@ impl HeapTable {
         self.current_page.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// 持久化 FSM 到文件
+    pub fn save_fsm<P: AsRef<std::path::Path>>(&self, path: P) -> ferrisdb_core::Result<()> {
+        let max = self.fsm_max_page.load(std::sync::atomic::Ordering::Acquire) as usize;
+        let max = max.min(self.fsm.len());
+        let mut buf = Vec::with_capacity(4 + max);
+        buf.extend_from_slice(&(max as u32).to_le_bytes());
+        for i in 0..max {
+            buf.push(self.fsm[i].load(std::sync::atomic::Ordering::Relaxed));
+        }
+        std::fs::write(path.as_ref(), &buf)
+            .map_err(|e| ferrisdb_core::FerrisDBError::Internal(format!("Failed to save FSM: {}", e)))?;
+        Ok(())
+    }
+
+    /// 从文件加载 FSM
+    pub fn load_fsm<P: AsRef<std::path::Path>>(&self, path: P) -> ferrisdb_core::Result<()> {
+        let data = match std::fs::read(path.as_ref()) {
+            Ok(d) => d,
+            Err(_) => return Ok(()), // 文件不存在 = 空 FSM
+        };
+        if data.len() < 4 { return Ok(()); }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0;4])) as usize;
+        let count = count.min(self.fsm.len()).min(data.len() - 4);
+        for i in 0..count {
+            self.fsm[i].store(data[4 + i], std::sync::atomic::Ordering::Relaxed);
+        }
+        self.fsm_max_page.store(count as u32, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// FSM: 查找有足够空闲空间的页（无锁）
     fn fsm_find_page(&self, needed: u16) -> Option<u32> {
         let threshold = if needed >= 8192 { 0 } else { 255 - (needed as u32 * 255 / 8192) as u8 };

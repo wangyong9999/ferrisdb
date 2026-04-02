@@ -9,15 +9,19 @@ use ferrisdb_transaction::heap::{HeapTable, TupleId};
 use ferrisdb_transaction::transaction::{Transaction, TransactionManager};
 
 /// 索引定义
+///
+/// 支持表达式索引：`key_extractor` 可以是任意函数，如 `|data| lower(col)` 等。
 pub struct IndexDef {
     /// 索引名称
     pub name: String,
     /// BTree 实例
     pub btree: BTree,
-    /// 从 tuple 数据提取 key 的函数
+    /// 从 tuple 数据提取 key 的函数（支持表达式索引）
     pub key_extractor: Box<dyn Fn(&[u8]) -> BTreeKey + Send + Sync>,
     /// 是否唯一约束
     pub unique: bool,
+    /// 是否表达式索引（true = key 由函数计算，非直接列值）
+    pub is_expression: bool,
 }
 
 /// 带自动索引维护的表

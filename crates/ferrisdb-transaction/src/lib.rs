@@ -8,6 +8,7 @@
 
 pub mod heap;
 pub mod lockmgr;
+pub mod ssi;
 pub mod transaction;
 pub mod undo;
 
@@ -16,3 +17,4 @@ pub use heap::{HeapScan, HeapTable, TupleHeader, TupleId};
 pub use lockmgr::{DeadlockDetector, Lock, LockManager, LockMode as HeavyLockMode, LockTag};
 pub use transaction::{Transaction, TransactionManager, TransactionState, UndoAction};
 pub use undo::{UndoRecord, UndoRecordType, UndoZone};
+pub use ssi::{SsiTracker, AccessKey};

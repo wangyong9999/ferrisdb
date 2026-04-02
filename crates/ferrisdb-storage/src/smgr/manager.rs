@@ -109,6 +109,8 @@ pub struct StorageManager {
     pdb_dirs: RwLock<HashMap<u32, PathBuf>>,
     /// 最大打开文件数（FD LRU 限制）
     max_open_files: usize,
+    /// 是否使用 Direct IO (O_DIRECT)
+    direct_io: bool,
 }
 
 impl StorageManager {
@@ -119,8 +121,23 @@ impl StorageManager {
             files: RwLock::new(HashMap::new()),
             pdb_dirs: RwLock::new(HashMap::new()),
             max_open_files: 256,
+            direct_io: false,
         }
     }
+
+    /// 创建带 DIO 的 Storage Manager
+    pub fn with_direct_io<P: AsRef<Path>>(data_dir: P) -> Self {
+        Self {
+            data_dir: data_dir.as_ref().to_path_buf(),
+            files: RwLock::new(HashMap::new()),
+            pdb_dirs: RwLock::new(HashMap::new()),
+            max_open_files: 256,
+            direct_io: true,
+        }
+    }
+
+    /// 是否启用 Direct IO
+    pub fn is_direct_io(&self) -> bool { self.direct_io }
 
     /// 初始化数据目录
     pub fn init(&self) -> Result<()> {

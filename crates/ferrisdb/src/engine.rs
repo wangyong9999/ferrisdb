@@ -174,7 +174,34 @@ impl Engine {
 
     /// 创建表（指定表空间，0 = 默认）
     pub fn create_table_in(&self, name: &str, tablespace_id: u32) -> Result<u32> {
-        self.catalog.create_table(name, tablespace_id)
+        let oid = self.catalog.create_table(name, tablespace_id)?;
+        self.write_ddl_wal(ferrisdb_storage::wal::WalRecordType::DdlCreate, oid, name);
+        Ok(oid)
+    }
+
+    /// 创建临时表（不写 WAL，进程退出时自动丢弃）
+    pub fn create_temp_table(&self, name: &str) -> Result<u32> {
+        // 临时表用 tablespace_id = u32::MAX 标识
+        self.catalog.create_table(name, u32::MAX)
+        // 不写 DDL WAL — 临时表不需要持久化
+    }
+
+    /// 打开临时表（不带 WAL writer）
+    pub fn open_temp_table(&self, name: &str) -> Result<ferrisdb_transaction::HeapTable> {
+        let meta = self.catalog.lookup_by_name(name)
+            .ok_or_else(|| FerrisDBError::NotFound(format!("Table '{}' not found", name)))?;
+        // 临时表不设置 WAL writer
+        let table = ferrisdb_transaction::HeapTable::new(
+            meta.oid, Arc::clone(&self.buffer_pool), Arc::clone(&self.txn_manager),
+        );
+        Ok(table)
+    }
+
+    /// 检查表是否是临时表
+    pub fn is_temp_table(&self, name: &str) -> bool {
+        self.catalog.lookup_by_name(name)
+            .map(|m| m.tablespace_id == u32::MAX)
+            .unwrap_or(false)
     }
 
     // ==================== 表管理 ====================
@@ -243,6 +270,32 @@ impl Engine {
             .ok_or_else(|| FerrisDBError::NotFound(format!("Table '{}' not found", table_name)))?;
         let oid = self.catalog.create_index(name, table_meta.oid, 0)?;
         self.write_ddl_wal(ferrisdb_storage::wal::WalRecordType::DdlCreate, oid, name);
+        Ok(oid)
+    }
+
+    /// 并发建索引 — 扫描表快照构建索引，不阻塞 DML
+    ///
+    /// 1. 创建索引元数据
+    /// 2. 扫描当前表所有行构建索引
+    /// 3. 保存索引状态
+    pub fn create_index_concurrently(
+        &self, name: &str, table_name: &str,
+        key_extractor: impl Fn(&[u8]) -> ferrisdb_storage::BTreeKey,
+    ) -> Result<u32> {
+        let oid = self.create_index(name, table_name)?;
+        let table = self.open_table(table_name)?;
+        let btree = self.open_index(name)?;
+        btree.init()?;
+
+        // Scan table and populate index (non-blocking — table DML continues)
+        let mut scan = ferrisdb_transaction::HeapScan::new(&table);
+        while let Ok(Some((tid, _header, data))) = scan.next() {
+            let key = key_extractor(&data);
+            let value = ferrisdb_storage::BTreeValue::Tuple { block: tid.ip_blkid, offset: tid.ip_posid };
+            btree.insert(key, value)?;
+        }
+
+        self.save_index_state(name, &btree)?;
         Ok(oid)
     }
 

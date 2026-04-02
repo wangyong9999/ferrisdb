@@ -655,8 +655,14 @@ impl BTree {
     }
 
     #[inline]
+    /// 获取 root page 号
     pub fn root_page(&self) -> u32 {
         self.root_page.load(Ordering::Acquire)
+    }
+
+    /// 设置 root page（从 catalog 恢复时使用）
+    pub fn set_root_page(&self, page: u32) {
+        self.root_page.store(page, Ordering::Release);
     }
 
     /// 回收空页面到 free list

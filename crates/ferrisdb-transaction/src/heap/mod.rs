@@ -166,6 +166,16 @@ impl HeapTable {
         self.wal_writer = Some(writer);
     }
 
+    /// 设置当前页面数（从 catalog 恢复时使用）
+    pub fn set_current_page(&self, page_count: u32) {
+        self.current_page.store(page_count, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 获取当前页面数（用于 catalog 持久化）
+    pub fn get_current_page(&self) -> u32 {
+        self.current_page.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// FSM: 查找有足够空闲空间的页（无锁）
     fn fsm_find_page(&self, needed: u16) -> Option<u32> {
         let threshold = if needed >= 8192 { 0 } else { 255 - (needed as u32 * 255 / 8192) as u8 };

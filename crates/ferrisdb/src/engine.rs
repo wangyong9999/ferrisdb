@@ -124,8 +124,8 @@ impl Engine {
             100,
         ));
 
-        // 7. 系统目录（内存，后续可持久化）
-        let catalog = Arc::new(SystemCatalog::new());
+        // 7. 系统目录（持久化到磁盘）
+        let catalog = Arc::new(SystemCatalog::open(&config.data_dir)?);
 
         // 8. 崩溃恢复
         if config.wal_enabled {
@@ -175,6 +175,8 @@ impl Engine {
     }
 
     /// 获取表句柄（用于 DML 操作）
+    ///
+    /// 从 catalog 恢复 current_page，确保重启后 insert 不覆盖旧数据。
     pub fn open_table(&self, name: &str) -> Result<ferrisdb_transaction::HeapTable> {
         let meta = self.catalog.lookup_by_name(name)
             .ok_or_else(|| FerrisDBError::NotFound(format!("Table '{}' not found", name)))?;
@@ -184,7 +186,18 @@ impl Engine {
         if let Some(ref w) = self.wal_writer {
             table.set_wal_writer(Arc::clone(w));
         }
+        // 从 catalog 恢复页面计数
+        if meta.current_pages > 0 {
+            table.set_current_page(meta.current_pages);
+        }
         Ok(table)
+    }
+
+    /// 保存表的当前页面计数到 catalog（调用者在 DML 后或 shutdown 前调用）
+    pub fn save_table_state(&self, name: &str, table: &ferrisdb_transaction::HeapTable) -> Result<()> {
+        let meta = self.catalog.lookup_by_name(name)
+            .ok_or_else(|| FerrisDBError::NotFound(format!("Table '{}' not found", name)))?;
+        self.catalog.update_pages(meta.oid, table.get_current_page(), meta.root_page)
     }
 
     // ==================== 事务 ====================
@@ -204,6 +217,8 @@ impl Engine {
     }
 
     /// 获取 B-Tree 索引句柄
+    ///
+    /// 从 catalog 恢复 root_page，确保重启后索引可用。
     pub fn open_index(&self, name: &str) -> Result<ferrisdb_storage::BTree> {
         let meta = self.catalog.lookup_by_name(name)
             .ok_or_else(|| FerrisDBError::NotFound(format!("Index '{}' not found", name)))?;
@@ -211,7 +226,18 @@ impl Engine {
         if let Some(ref w) = self.wal_writer {
             btree.set_wal_writer(Arc::clone(w));
         }
+        // 从 catalog 恢复 root_page
+        if meta.root_page != u32::MAX {
+            btree.set_root_page(meta.root_page);
+        }
         Ok(btree)
+    }
+
+    /// 保存索引状态到 catalog
+    pub fn save_index_state(&self, name: &str, btree: &ferrisdb_storage::BTree) -> Result<()> {
+        let meta = self.catalog.lookup_by_name(name)
+            .ok_or_else(|| FerrisDBError::NotFound(format!("Index '{}' not found", name)))?;
+        self.catalog.update_pages(meta.oid, meta.current_pages, btree.root_page())
     }
 
     // ==================== 访问内部组件 ====================

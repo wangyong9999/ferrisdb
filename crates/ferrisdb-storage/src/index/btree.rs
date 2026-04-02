@@ -665,6 +665,16 @@ impl BTree {
         self.root_page.store(page, Ordering::Release);
     }
 
+    /// 设置 next page 分配计数器（从 catalog 恢复）
+    pub fn set_next_page(&self, page: u32) {
+        self.next_page.store(page, Ordering::Release);
+    }
+
+    /// 获取 next page 计数器
+    pub fn next_page_count(&self) -> u32 {
+        self.next_page.load(Ordering::Acquire)
+    }
+
     /// 回收空页面到 free list
     fn recycle_page(&self, page_no: u32) {
         self.free_pages.lock().push(page_no);

@@ -226,18 +226,21 @@ impl Engine {
         if let Some(ref w) = self.wal_writer {
             btree.set_wal_writer(Arc::clone(w));
         }
-        // 从 catalog 恢复 root_page
+        // 从 catalog 恢复 root_page 和 next_page
         if meta.root_page != u32::MAX {
             btree.set_root_page(meta.root_page);
+        }
+        if meta.current_pages > 0 {
+            btree.set_next_page(meta.current_pages);
         }
         Ok(btree)
     }
 
-    /// 保存索引状态到 catalog
+    /// 保存索引状态到 catalog（root_page + next_page）
     pub fn save_index_state(&self, name: &str, btree: &ferrisdb_storage::BTree) -> Result<()> {
         let meta = self.catalog.lookup_by_name(name)
             .ok_or_else(|| FerrisDBError::NotFound(format!("Index '{}' not found", name)))?;
-        self.catalog.update_pages(meta.oid, meta.current_pages, btree.root_page())
+        self.catalog.update_pages(meta.oid, btree.next_page_count(), btree.root_page())
     }
 
     // ==================== 访问内部组件 ====================

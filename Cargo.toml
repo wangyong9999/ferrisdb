@@ -4,6 +4,7 @@ members = [
     "crates/ferrisdb-core",
     "crates/ferrisdb-storage",
     "crates/ferrisdb-transaction",
+    "crates/ferrisdb",
     "crates/ferrisdb-bench",
 ]
 

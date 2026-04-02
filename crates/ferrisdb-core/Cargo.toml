@@ -1,0 +1,33 @@
+[package]
+name = "ferrisdb-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DStore core types, concurrency primitives, and thread abstractions"
+
+[dependencies]
+parking_lot.workspace = true
+parking_lot_core = "0.9"
+bytemuck.workspace = true
+memoffset.workspace = true
+thiserror.workspace = true
+cfg-if.workspace = true
+static_assertions.workspace = true
+
+[dependencies.loom]
+workspace = true
+optional = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[features]
+default = []
+loom = ["dep:loom"]
+
+# [[bench]]
+# name = "lwlock_bench"
+# harness = false

@@ -1,0 +1,28 @@
+[package]
+name = "ferrisdb-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DStore benchmarks including TPCC"
+
+[[bin]]
+name = "tpcc"
+path = "src/tpcc.rs"
+
+[dependencies]
+ferrisdb-core = { path = "../ferrisdb-core" }
+ferrisdb-storage = { path = "../ferrisdb-storage" }
+ferrisdb-transaction = { path = "../ferrisdb-transaction" }
+
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+rand = "0.8"
+tempfile = "3"
+
+[features]
+default = []

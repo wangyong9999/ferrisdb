@@ -1,0 +1,36 @@
+[package]
+name = "ferrisdb-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DStore storage engine - buffer, page, WAL, and storage manager"
+
+[dependencies]
+ferrisdb-core = { path = "../ferrisdb-core" }
+
+parking_lot.workspace = true
+parking_lot_core = "0.9"
+crc32fast.workspace = true
+libc = "0.2"
+crossbeam.workspace = true
+bytemuck.workspace = true
+memoffset.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+cfg-if.workspace = true
+static_assertions.workspace = true
+
+[dependencies.loom]
+workspace = true
+optional = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+tempfile = "3"
+
+[features]
+default = []
+loom = ["dep:loom", "ferrisdb-core/loom"]

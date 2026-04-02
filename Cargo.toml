@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ferrisdb-core",
+    "crates/ferrisdb-storage",
+    "crates/ferrisdb-transaction",
+    "crates/ferrisdb-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["FerrisDB Contributors"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# 内部 crates
+ferrisdb-core = { path = "crates/ferrisdb-core" }
+ferrisdb-storage = { path = "crates/ferrisdb-storage" }
+ferrisdb-transaction = { path = "crates/ferrisdb-transaction" }
+
+# 外部依赖
+parking_lot = "0.12"
+crossbeam = "0.8"
+bytemuck = { version = "1.14", features = ["derive"] }
+memoffset = "0.9"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+cfg-if = "1.0"
+static_assertions = "1.1"
+
+# CRC
+crc32fast = "1.4"
+
+# 测试依赖
+loom = "0.7"
+proptest = "1.4"
+criterion = "0.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.test]
+opt-level = 2

@@ -1,0 +1,26 @@
+[package]
+name = "ferrisdb-transaction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DStore transaction management - MVCC, undo, lock manager"
+
+[dependencies]
+ferrisdb-core = { path = "../ferrisdb-core" }
+ferrisdb-storage = { path = "../ferrisdb-storage" }
+
+parking_lot.workspace = true
+crossbeam.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+cfg-if.workspace = true
+static_assertions.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile = "3"
+
+[features]
+default = []

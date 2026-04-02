@@ -164,11 +164,12 @@ impl Engine {
 
     // ==================== 表空间管理 ====================
 
-    /// 创建表空间（路径名编码在 name 中：`ts_name::/path/to/dir`）
+    /// 创建表空间
     pub fn create_tablespace(&self, name: &str, _path: &str) -> Result<u32> {
-        // 表空间用 RelationType::System + name 前缀 "ts:" 标识
         let ts_name = format!("ts:{}", name);
-        self.catalog.create_table(&ts_name, 0) // 复用 create_table 存储
+        let oid = self.catalog.create_table(&ts_name, 0)?;
+        self.write_ddl_wal(ferrisdb_storage::wal::WalRecordType::DdlCreate, oid, &ts_name);
+        Ok(oid)
     }
 
     /// 创建表（指定表空间，0 = 默认）
@@ -180,14 +181,19 @@ impl Engine {
 
     /// 创建表（默认表空间），返回 table OID
     pub fn create_table(&self, name: &str) -> Result<u32> {
-        self.catalog.create_table(name, 0)
+        let oid = self.catalog.create_table(name, 0)?;
+        self.write_ddl_wal(ferrisdb_storage::wal::WalRecordType::DdlCreate, oid, name);
+        Ok(oid)
     }
 
     /// 删除表
     pub fn drop_table(&self, name: &str) -> Result<()> {
         let meta = self.catalog.lookup_by_name(name)
             .ok_or_else(|| FerrisDBError::NotFound(format!("Table '{}' not found", name)))?;
-        self.catalog.drop_relation(meta.oid)
+        let oid = meta.oid;
+        self.catalog.drop_relation(oid)?;
+        self.write_ddl_wal(ferrisdb_storage::wal::WalRecordType::DdlDrop, oid, name);
+        Ok(())
     }
 
     /// 获取表句柄（用于 DML 操作）
@@ -235,7 +241,9 @@ impl Engine {
     pub fn create_index(&self, name: &str, table_name: &str) -> Result<u32> {
         let table_meta = self.catalog.lookup_by_name(table_name)
             .ok_or_else(|| FerrisDBError::NotFound(format!("Table '{}' not found", table_name)))?;
-        self.catalog.create_index(name, table_meta.oid, 0)
+        let oid = self.catalog.create_index(name, table_meta.oid, 0)?;
+        self.write_ddl_wal(ferrisdb_storage::wal::WalRecordType::DdlCreate, oid, name);
+        Ok(oid)
     }
 
     /// 获取 B-Tree 索引句柄
@@ -278,6 +286,23 @@ impl Engine {
 
     /// 系统目录（高级用途）
     pub fn catalog(&self) -> &Arc<SystemCatalog> { &self.catalog }
+
+    // ==================== 内部方法 ====================
+
+    /// 写入 DDL WAL 记录（create/drop table/index/tablespace）
+    fn write_ddl_wal(&self, rtype: ferrisdb_storage::wal::WalRecordType, oid: u32, name: &str) {
+        if let Some(ref w) = self.wal_writer {
+            let header = ferrisdb_storage::wal::WalRecordHeader::new(rtype, (4 + name.len()) as u16);
+            let hdr_size = std::mem::size_of::<ferrisdb_storage::wal::WalRecordHeader>();
+            let mut buf = Vec::with_capacity(hdr_size + 4 + name.len());
+            buf.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(&header as *const _ as *const u8, hdr_size)
+            });
+            buf.extend_from_slice(&oid.to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            let _ = w.write(&buf);
+        }
+    }
 }
 
 #[cfg(test)]

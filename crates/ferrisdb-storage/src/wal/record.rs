@@ -68,6 +68,12 @@ pub enum WalRecordType {
     /// 事务回滚
     TxnAbort = 176,
 
+    // === DDL 记录类型 ===
+    /// 创建表/索引/表空间
+    DdlCreate = 190,
+    /// 删除表/索引/表空间
+    DdlDrop = 191,
+
     // === 其他 ===
     /// 下一个 CSN
     NextCsn = 179,
@@ -106,6 +112,8 @@ impl TryFrom<u16> for WalRecordType {
             176 => Ok(Self::TxnAbort),
             179 => Ok(Self::NextCsn),
             180 => Ok(Self::BarrierCsn),
+            190 => Ok(Self::DdlCreate),
+            191 => Ok(Self::DdlDrop),
             _ => Err(()),
         }
     }

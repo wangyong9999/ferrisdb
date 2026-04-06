@@ -141,6 +141,7 @@ mod tests {
             btree,
             key_extractor: Box::new(|data| BTreeKey::new(data[0..4].to_vec())),
             unique: true,
+            is_expression: false,
         });
 
         let data = b"key1_rest_of_data";
@@ -165,6 +166,7 @@ mod tests {
             btree,
             key_extractor: Box::new(|data| BTreeKey::new(data[0..4].to_vec())),
             unique: false,
+            is_expression: false,
         });
 
         let data = b"abcd_rest";
@@ -189,6 +191,7 @@ mod tests {
             btree,
             key_extractor: Box::new(|data| BTreeKey::new(data[0..4].to_vec())),
             unique: true,
+            is_expression: false,
         });
 
         mt.insert(b"key1_data", Xid::new(0, 1), 0).unwrap();
@@ -204,8 +207,8 @@ mod tests {
 
         let bt1 = BTree::new(103, Arc::clone(&bp)); bt1.init().unwrap();
         let bt2 = BTree::new(104, Arc::clone(&bp)); bt2.init().unwrap();
-        mt.add_index(IndexDef { name: "idx1".to_string(), btree: bt1, key_extractor: Box::new(|d| BTreeKey::new(d[0..2].to_vec())), unique: false });
-        mt.add_index(IndexDef { name: "idx2".to_string(), btree: bt2, key_extractor: Box::new(|d| BTreeKey::new(d[2..4].to_vec())), unique: false });
+        mt.add_index(IndexDef { name: "idx1".to_string(), btree: bt1, key_extractor: Box::new(|d| BTreeKey::new(d[0..2].to_vec())), unique: false, is_expression: false });
+        mt.add_index(IndexDef { name: "idx2".to_string(), btree: bt2, key_extractor: Box::new(|d| BTreeKey::new(d[2..4].to_vec())), unique: false, is_expression: false });
         assert_eq!(mt.index_count(), 2);
 
         mt.insert(b"aabb_data", Xid::new(0, 1), 0).unwrap();

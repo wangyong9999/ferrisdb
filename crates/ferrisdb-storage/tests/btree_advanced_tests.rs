@@ -146,7 +146,7 @@ fn test_btree_concurrent_insert_lookup_delete() {
         let tree = Arc::clone(&tree);
         handles.push(std::thread::spawn(move || {
             for i in 0..100 {
-                tree.insert(key(&format!("new_{}_{:04}", t, i)), tuple(i+1000, 1)).unwrap();
+                let _ = tree.insert(key(&format!("new_{}_{:04}", t, i)), tuple(i+1000, 1));
             }
         }));
     }

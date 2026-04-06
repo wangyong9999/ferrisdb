@@ -35,7 +35,7 @@ use std::thread::{self, JoinHandle};
 use ferrisdb_core::{BufferTag, Lsn, Xid};
 use ferrisdb_core::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use ferrisdb_core::error::{FerrisDBError, Result};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use super::record::WalRecordType;
 
@@ -88,6 +88,8 @@ struct PageBatch {
 struct WorkerQueue {
     /// 待处理批次
     batches: Mutex<Vec<PageBatch>>,
+    /// 通知 worker 有新任务或关闭
+    condvar: Condvar,
     /// 是否已关闭
     closed: AtomicBool,
 }
@@ -96,6 +98,7 @@ impl WorkerQueue {
     fn new() -> Self {
         Self {
             batches: Mutex::new(Vec::new()),
+            condvar: Condvar::new(),
             closed: AtomicBool::new(false),
         }
     }
@@ -103,6 +106,7 @@ impl WorkerQueue {
     fn push(&self, batch: PageBatch) {
         let mut batches = self.batches.lock();
         batches.push(batch);
+        self.condvar.notify_one();
     }
 
     fn pop(&self) -> Option<PageBatch> {
@@ -110,8 +114,17 @@ impl WorkerQueue {
         batches.pop()
     }
 
+    /// 等待直到有任务或关闭
+    fn wait_for_work(&self) {
+        let mut batches = self.batches.lock();
+        if batches.is_empty() && !self.closed.load(Ordering::Acquire) {
+            self.condvar.wait_for(&mut batches, std::time::Duration::from_millis(10));
+        }
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        self.condvar.notify_all();
     }
 
     fn is_closed(&self) -> bool {
@@ -163,8 +176,8 @@ impl RedoWorker {
                 // 队列已关闭且为空，退出
                 break;
             } else {
-                // 等待新任务
-                std::hint::spin_loop();
+                // 等待新任务（Condvar 避免 busy-spin）
+                self.queue.wait_for_work();
             }
         }
     }
@@ -246,6 +259,7 @@ impl ParallelRedoCoordinator {
 
         // 派发到 Worker 队列
         self.worker_queues[worker_id].push(batch);
+        self.total_processed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 批量派发记录

@@ -235,11 +235,38 @@ impl WalWriter {
         }
         let file = file_guard.as_mut().unwrap();
 
-        // 写入（buffered I/O，实际不触发 syscall 直到 buffer 满或 sync）
-        file.write_all(data)
-            .map_err(|e| FerrisDBError::Wal(WalError::WriteFailed(
-                format!("Failed to write WAL data: {}", e)
-            )))?;
+        // 计算 CRC 并单次 write_all（避免分段写入在 crash 间隙产生不一致记录）
+        // WalRecordHeader 布局: [size:2][rtype:2][crc:4]
+        let map_err = |e: std::io::Error| FerrisDBError::Wal(WalError::WriteFailed(
+            format!("Failed to write WAL data: {}", e)
+        ));
+        if data.len() >= 8 {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&data[0..4]);  // size + rtype
+            hasher.update(&data[8..]);   // payload
+            let crc = hasher.finalize();
+
+            // 构造完整记录：[size:2][rtype:2][crc:4][payload...]
+            // 栈上小缓冲区避免大多数情况的堆分配
+            let total_len = data.len();
+            if total_len <= 512 {
+                // 小记录：栈上缓冲区
+                let mut buf = [0u8; 512];
+                buf[0..4].copy_from_slice(&data[0..4]);
+                buf[4..8].copy_from_slice(&crc.to_le_bytes());
+                buf[8..total_len].copy_from_slice(&data[8..]);
+                file.write_all(&buf[..total_len]).map_err(map_err)?;
+            } else {
+                // 大记录：堆分配
+                let mut buf = Vec::with_capacity(total_len);
+                buf.extend_from_slice(&data[0..4]);
+                buf.extend_from_slice(&crc.to_le_bytes());
+                buf.extend_from_slice(&data[8..]);
+                file.write_all(&buf).map_err(map_err)?;
+            }
+        } else {
+            file.write_all(data).map_err(map_err)?;
+        }
 
         // 更新偏移量
         self.offset.fetch_add(data_len, Ordering::AcqRel);

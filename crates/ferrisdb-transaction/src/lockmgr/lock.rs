@@ -141,20 +141,24 @@ impl Lock {
         }
     }
 
-    /// 尝试获取锁
-    ///
-    /// 返回是否成功
+    /// 尝试获取锁（原子 CAS，防止 TOCTOU 竞态）
     pub fn try_acquire(&self, mode: LockMode) -> bool {
-        let current = self.hold_mode.load(Ordering::Acquire);
-        let current_mode = Self::u8_to_mode(current);
+        loop {
+            let current = self.hold_mode.load(Ordering::Acquire);
+            let current_mode = Self::u8_to_mode(current);
 
-        if mode.conflicts_with(current_mode) && current_mode != LockMode::None {
-            return false;
+            if mode.conflicts_with(current_mode) && current_mode != LockMode::None {
+                return false;
+            }
+
+            // CAS: 只有当 hold_mode 未被并发修改时才更新
+            match self.hold_mode.compare_exchange(
+                current, mode as u8, Ordering::AcqRel, Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue, // 被并发修改，重试
+            }
         }
-
-        // 更新持有模式
-        self.hold_mode.store(mode as u8, Ordering::Release);
-        true
     }
 
     /// 释放锁

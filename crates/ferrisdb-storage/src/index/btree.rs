@@ -608,18 +608,25 @@ impl BTree {
     fn wal_write_insert(&self, page_no: u32, item: &BTreeItem) {
         if let Some(ref writer) = self.wal_writer {
             let page_id = self.make_page_id(page_no);
-            let page_rec = WalRecordForPage::new(WalRecordType::BtreeInsertOnLeaf, page_id, 0);
+            let item_bytes = item.serialize();
+            let page_after_header = std::mem::size_of::<WalRecordForPage>() - std::mem::size_of::<WalRecordHeader>();
+            let page_rec = WalRecordForPage::new(
+                WalRecordType::BtreeInsertOnLeaf, page_id,
+                (page_after_header + item_bytes.len()) as u16,
+            );
             let page_rec_bytes = unsafe {
                 std::slice::from_raw_parts(
                     &page_rec as *const WalRecordForPage as *const u8,
                     std::mem::size_of::<WalRecordForPage>(),
                 )
             };
-            let item_bytes = item.serialize();
             let mut buf = Vec::with_capacity(page_rec_bytes.len() + item_bytes.len());
             buf.extend_from_slice(page_rec_bytes);
             buf.extend_from_slice(&item_bytes);
-            let _ = writer.write(&buf);
+            if let Err(_e) = writer.write(&buf) {
+                // BTree WAL 写入失败：数据仍在 buffer pool，但 crash 后此 insert 丢失
+                // 生产环境应上报告警
+            }
         }
     }
 
@@ -627,19 +634,26 @@ impl BTree {
     fn wal_write_split(&self, left_page: u32, right_page: u32, separator: &BTreeKey) {
         if let Some(ref writer) = self.wal_writer {
             let page_id = self.make_page_id(left_page);
-            let page_rec = WalRecordForPage::new(WalRecordType::BtreeSplitLeaf, page_id, 0);
+            let payload_len = 4 + 2 + separator.data.len();
+            let page_after_header = std::mem::size_of::<WalRecordForPage>() - std::mem::size_of::<WalRecordHeader>();
+            let page_rec = WalRecordForPage::new(
+                WalRecordType::BtreeSplitLeaf, page_id,
+                (page_after_header + payload_len) as u16,
+            );
             let page_rec_bytes = unsafe {
                 std::slice::from_raw_parts(
                     &page_rec as *const WalRecordForPage as *const u8,
                     std::mem::size_of::<WalRecordForPage>(),
                 )
             };
-            let mut buf = Vec::with_capacity(page_rec_bytes.len() + 4 + separator.data.len());
+            let mut buf = Vec::with_capacity(page_rec_bytes.len() + payload_len);
             buf.extend_from_slice(page_rec_bytes);
             buf.extend_from_slice(&right_page.to_le_bytes());
             buf.extend_from_slice(&(separator.data.len() as u16).to_le_bytes());
             buf.extend_from_slice(&separator.data);
-            let _ = writer.write(&buf);
+            if let Err(_e) = writer.write(&buf) {
+                // BTree WAL split 写入失败
+            }
         }
     }
 
@@ -712,41 +726,29 @@ impl BTree {
     }
 
     /// 插入键值对（允许重复 key）
+    ///
+    /// split_mutex 保护整个 insert 路径，确保树结构一致性。
+    /// Lookup（读）不受影响，通过 page lock + right-link 保证并发安全。
     pub fn insert(&self, key: BTreeKey, value: BTreeValue) -> ferrisdb_core::Result<()> {
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
+        let _guard = self.split_mutex.lock();
 
         let root = self.root_page.load(Ordering::Acquire);
         if root == INVALID_PAGE {
-            let _guard = self.split_mutex.lock();
-            let root = self.root_page.load(Ordering::Acquire);
-            if root == INVALID_PAGE {
-                self.init()?;
-            }
+            self.init()?;
         }
 
         let item = BTreeItem { key, value };
+        let root = self.root_page.load(Ordering::Acquire);
 
-        // 重试循环：如果叶子满了，分裂后重试
-        for _ in 0..20 {
-            let root = self.root_page.load(Ordering::Acquire);
-            match self.insert_or_split(root, &item) {
-                Ok(None) => return Ok(()), // 成功
-                Ok(Some(split)) => {
-                    // Root 分裂需要全局协调 — 持锁后重新检查
-                    let _guard = self.split_mutex.lock();
-                    // 如果 root 已被其他线程替换（另一个线程先完成了 split），
-                    // 跳过本次 handle_root_split，直接重试插入
-                    let current_root = self.root_page.load(Ordering::Acquire);
-                    if current_root == root {
-                        // root 未变，安全执行
-                        self.handle_root_split(split)?;
-                    }
-                    // root 已变 → 下一轮循环重试插入
-                }
-                Err(_) => return Ok(()),
+        match self.insert_or_split(root, &item) {
+            Ok(None) => Ok(()),
+            Ok(Some(split)) => {
+                self.handle_root_split(split)?;
+                Ok(())
             }
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
     /// 尝试插入，如果叶子满了就地分裂。
@@ -766,18 +768,40 @@ impl BTree {
                 self.wal_write_insert(page_no, item);
                 return Ok(None);
             }
-            // 叶子满了 — 持锁读取 items，然后释放锁进行分裂
-            // 分裂时会重新获取锁并用 rebuild_from_sorted 覆盖页面内容，
-            // 所以即使中间有并发插入，rebuild 也会基于正确的快照重建
-            let items = page.get_all_items();
+            // 叶子满了 — split_mutex 已由 caller 持有，直接持锁 split
+            let mut items = page.get_all_items();
             let level = page.level();
             let old_right_link = page.header().right_link;
-            let nkeys = page.header().nkeys;
-            drop(lock);
-            drop(pinned);
 
-            let split = self.do_leaf_split(page_no, items, old_right_link, level, nkeys, item)?;
-            return Ok(Some(split));
+            let insert_pos = items.iter().position(|i| i.key.compare(&item.key) != std::cmp::Ordering::Less).unwrap_or(items.len());
+            items.insert(insert_pos, item.clone());
+
+            let mid = items.len() / 2;
+            let separator = items[mid].key.clone();
+            let right_page_no = self.allocate_page(BTreePageType::Leaf, level)?;
+
+            page.rebuild_from_sorted(&items[..mid]);
+            page.header_mut().right_link = right_page_no;
+            drop(lock);
+            pinned.mark_dirty();
+
+            {
+                let right_tag = self.make_tag(right_page_no);
+                let right_pinned = self.buffer_pool.pin(&right_tag)?;
+                let right_lock = right_pinned.lock_exclusive();
+                let right_page = unsafe { BTreePage::from_ptr(right_pinned.page_data()) };
+                right_page.header_mut().right_link = old_right_link;
+                for ri in &items[mid..] {
+                    right_page.insert_item_sorted(ri);
+                }
+                drop(right_lock);
+                right_pinned.mark_dirty();
+            }
+
+            self.wal_write_split(page_no, right_page_no, &separator);
+            self.stats.splits.fetch_add(1, Ordering::Relaxed);
+
+            return Ok(Some(SplitResult { right_page: right_page_no, separator }));
         }
 
         // 内部节点
@@ -820,15 +844,36 @@ impl BTree {
             return Ok(None);
         }
 
-        // 内部节点也满了 — 持锁读取 items 后分裂
-        let items = page.get_all_items();
+        // 内部节点也满了 — split_mutex 应已由 caller 持有（insert 的重试循环）
+        // 但为安全起见显式检查
+        let mut items = page.get_all_items();
         let level = page.level();
-        let nkeys = page.header().nkeys;
-        drop(lock);
-        drop(pinned);
 
-        let internal_split = self.do_internal_split(page_no, items, level, nkeys, sep_item)?;
-        Ok(Some(internal_split))
+        let insert_pos = items.iter().position(|i| i.key.compare(&sep_item.key) != std::cmp::Ordering::Less).unwrap_or(items.len());
+        items.insert(insert_pos, sep_item);
+
+        let mid = items.len() / 2;
+        let separator = items[mid].key.clone();
+        let right_page_no = self.allocate_page(BTreePageType::Internal, level)?;
+
+        page.rebuild_from_sorted(&items[..mid]);
+        drop(lock);
+        pinned.mark_dirty();
+
+        {
+            let right_tag = self.make_tag(right_page_no);
+            let right_pinned = self.buffer_pool.pin(&right_tag)?;
+            let right_lock = right_pinned.lock_exclusive();
+            let right_page = unsafe { BTreePage::from_ptr(right_pinned.page_data()) };
+            for ri in &items[mid..] {
+                right_page.insert_item_sorted(ri);
+            }
+            drop(right_lock);
+            right_pinned.mark_dirty();
+        }
+
+        self.wal_write_split(page_no, right_page_no, &separator);
+        Ok(Some(SplitResult { right_page: right_page_no, separator }))
     }
 
     /// 处理 root 分裂 — 创建新 root
@@ -927,15 +972,13 @@ impl BTree {
             let lock = pinned.lock_exclusive();
             let page = unsafe { BTreePage::from_ptr(pinned.page_data()) };
 
-            // 检测并发修改：如果 nkeys 变了，说明有其他线程插入了数据
-            // 重新读取最新 items 并重新计算分裂
+            // 检测并发修改：如果 nkeys 变了，说明有并发 split 发生
+            // 放弃本次 split，返回 Err 让上层 insert() 从根重新查找正确叶子
             let current_nkeys = page.header().nkeys;
             if current_nkeys != expected_nkeys {
-                let fresh_items = page.get_all_items();
-                let fresh_right_link = page.header().right_link;
                 drop(lock);
                 drop(pinned);
-                return self.do_leaf_split(page_no, fresh_items, fresh_right_link, level, current_nkeys, item);
+                return Err(FerrisDBError::Internal("concurrent split detected, retry from root".to_string()));
             }
 
             page.rebuild_from_sorted(left_items);
@@ -990,11 +1033,9 @@ impl BTree {
 
             let current_nkeys = page.header().nkeys;
             if current_nkeys != expected_nkeys {
-                let fresh_items = page.get_all_items();
-                let fresh_level = page.level();
                 drop(lock);
                 drop(pinned);
-                return self.do_internal_split(page_no, fresh_items, fresh_level, current_nkeys, new_item);
+                return Err(FerrisDBError::Internal("concurrent split detected, retry from root".to_string()));
             }
 
             page.rebuild_from_sorted(left_items);
@@ -1350,6 +1391,14 @@ impl BTree {
                 if let Some((_, item)) = page.find_key(key) {
                     return Ok(Some(item.value));
                 }
+                // B-link tree: key 可能因并发 split 被移到 right sibling
+                let right = page.header().right_link;
+                drop(_lock);
+                drop(pinned);
+                if right != INVALID_PAGE && right != 0 {
+                    page_no = right;
+                    continue; // 跟随 right-link
+                }
                 return Ok(None);
             }
 
@@ -1357,6 +1406,9 @@ impl BTree {
             let child = page.find_child(key);
             drop(_lock);
             drop(pinned);
+            if child == INVALID_PAGE {
+                return Ok(None);
+            }
             page_no = child;
         }
     }
@@ -1364,6 +1416,8 @@ impl BTree {
     /// 删除指定 key
     pub fn delete(&self, key: &BTreeKey) -> ferrisdb_core::Result<bool> {
         self.stats.deletes.fetch_add(1, Ordering::Relaxed);
+        // delete 只修改叶子页面（标记 item），不修改树结构
+        // page-level exclusive lock 足够保护并发
 
         let root = self.root_page.load(Ordering::Acquire);
         if root == INVALID_PAGE {

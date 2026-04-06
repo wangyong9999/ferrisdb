@@ -187,11 +187,11 @@ fn test_recovery_with_records() {
     w.sync().unwrap();
     drop(w);
 
-    // Recover
+    // Recover (scan-only — 测试 WAL 解析，不写入不存在的表数据)
     let smgr = Arc::new(StorageManager::new(td.path()));
     smgr.init().unwrap();
     let recovery = WalRecovery::with_smgr(&wal_dir, smgr);
-    recovery.recover(RecoveryMode::CrashRecovery).unwrap();
+    recovery.recover_scan_only().unwrap();
 
     let stats = recovery.stats();
     assert!(stats.records_redone + stats.records_skipped > 0);

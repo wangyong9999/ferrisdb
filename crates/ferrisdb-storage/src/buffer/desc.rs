@@ -368,12 +368,10 @@ impl BufferDesc {
         ).is_ok()
     }
 
-    /// 解锁 header
+    /// 解锁 header（使用原子 fetch_and 避免覆盖并发 pin/dirty 更新）
     #[inline]
     pub fn unlock_header(&self) {
-        let old_state = self.state.load(Ordering::Acquire);
-        let new_state = old_state & !state_bits::BM_LOCKED;
-        self.state.store(new_state, Ordering::Release);
+        self.state.fetch_and(!state_bits::BM_LOCKED, Ordering::Release);
     }
 
     /// 设置脏页标志

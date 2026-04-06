@@ -61,6 +61,14 @@ pub enum WalRecordType {
     // === Undo 记录类型 ===
     /// Undo 插入记录
     UndoInsertRecord = 160,
+    /// Undo 删除记录
+    UndoDeleteRecord = 161,
+    /// Undo 原地更新记录
+    UndoUpdateRecord = 162,
+    /// Undo 跨页更新旧页记录
+    UndoUpdateOldPage = 163,
+    /// Undo 跨页更新新页记录
+    UndoUpdateNewPage = 164,
 
     // === 事务记录类型 ===
     /// 事务提交
@@ -108,6 +116,10 @@ impl TryFrom<u16> for WalRecordType {
             155 => Ok(Self::CheckpointOnline),
             158 => Ok(Self::HeapPageFull),
             160 => Ok(Self::UndoInsertRecord),
+            161 => Ok(Self::UndoDeleteRecord),
+            162 => Ok(Self::UndoUpdateRecord),
+            163 => Ok(Self::UndoUpdateOldPage),
+            164 => Ok(Self::UndoUpdateNewPage),
             175 => Ok(Self::TxnCommit),
             176 => Ok(Self::TxnAbort),
             179 => Ok(Self::NextCsn),
@@ -119,24 +131,45 @@ impl TryFrom<u16> for WalRecordType {
     }
 }
 
-/// WAL 记录头部（基础）
+/// WAL 记录头部（基础，含 CRC 校验）
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct WalRecordHeader {
-    /// 记录大小
+    /// 记录大小（不含头部）
     pub size: u16,
     /// 记录类型
     pub rtype: u16,
+    /// CRC32 校验（覆盖 size + rtype + record data）
+    pub crc: u32,
 }
 
 impl WalRecordHeader {
-    /// 创建新的 WAL 记录头部
+    /// 创建新的 WAL 记录头部（CRC 稍后由 writer 填充）
     #[inline]
     pub const fn new(rtype: WalRecordType, size: u16) -> Self {
         Self {
             size,
             rtype: rtype as u16,
+            crc: 0,
         }
+    }
+
+    /// 计算并设置 CRC（覆盖 header 的 size+rtype 及 record data）
+    pub fn compute_crc(&mut self, data: &[u8]) {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&self.size.to_le_bytes());
+        hasher.update(&self.rtype.to_le_bytes());
+        hasher.update(data);
+        self.crc = hasher.finalize();
+    }
+
+    /// 校验 CRC
+    pub fn verify_crc(&self, data: &[u8]) -> bool {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&self.size.to_le_bytes());
+        hasher.update(&self.rtype.to_le_bytes());
+        hasher.update(data);
+        hasher.finalize() == self.crc
     }
 
     /// 获取记录类型
@@ -152,7 +185,7 @@ impl WalRecordHeader {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<WalRecordHeader>() == 4);
+const _: () = assert!(std::mem::size_of::<WalRecordHeader>() == 8);
 
 /// 页面 WAL 记录头部（带页面信息）
 #[derive(Debug, Clone, Copy)]
@@ -306,6 +339,7 @@ pub struct WalCheckpoint {
 impl WalCheckpoint {
     /// 创建新的检查点记录
     pub fn new(disk_recovery_plsn: u64, shutdown: bool) -> Self {
+        let data_size = std::mem::size_of::<Self>() - std::mem::size_of::<WalRecordHeader>();
         Self {
             header: WalRecordHeader::new(
                 if shutdown {
@@ -313,7 +347,7 @@ impl WalCheckpoint {
                 } else {
                     WalRecordType::CheckpointOnline
                 },
-                0,
+                data_size as u16,
             ),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -325,15 +359,18 @@ impl WalCheckpoint {
         }
     }
 
-    /// 序列化为字节
+    /// 序列化为字节（包含 header）
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(std::mem::size_of::<Self>());
-        // 简化实现：直接写入关键字段
-        bytes.extend_from_slice(&self.timestamp.to_le_bytes());
-        bytes.extend_from_slice(&self.disk_recovery_plsn.to_le_bytes());
-        bytes.push(self.checkpoint_type);
-        bytes.extend_from_slice(&self._padding);
-        bytes
+        let size = std::mem::size_of::<Self>();
+        let mut buf = vec![0u8; size];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self as *const Self as *const u8,
+                buf.as_mut_ptr(),
+                size,
+            );
+        }
+        buf
     }
 }
 
@@ -352,11 +389,13 @@ pub struct WalHeapInsert {
 impl WalHeapInsert {
     /// 创建新的 Heap 插入记录
     pub fn new(page_id: PageId, tuple_offset: u16, tuple_data: &[u8]) -> Self {
+        // header.size = 整个序列化 blob 减去 WalRecordHeader 的大小 + tuple_data
+        let struct_after_header = std::mem::size_of::<Self>() - std::mem::size_of::<WalRecordHeader>();
         Self {
             page_header: WalRecordForPage::new(
                 WalRecordType::HeapInsert,
                 page_id,
-                (4 + tuple_data.len()) as u16,
+                (struct_after_header + tuple_data.len()) as u16,
             ),
             tuple_offset,
             tuple_size: tuple_data.len() as u16,
@@ -393,11 +432,12 @@ pub struct WalHeapDelete {
 impl WalHeapDelete {
     /// 创建新的 Heap 删除记录
     pub fn new(page_id: PageId, tuple_offset: u16) -> Self {
+        let struct_after_header = std::mem::size_of::<Self>() - std::mem::size_of::<WalRecordHeader>();
         Self {
             page_header: WalRecordForPage::new(
                 WalRecordType::HeapDelete,
                 page_id,
-                4,
+                struct_after_header as u16,
             ),
             tuple_offset,
             _reserved: 0,
@@ -431,11 +471,12 @@ pub struct WalHeapInplaceUpdate {
 impl WalHeapInplaceUpdate {
     /// 创建新的原地更新记录
     pub fn new(page_id: PageId, tuple_offset: u16, tuple_data: &[u8]) -> Self {
+        let struct_after_header = std::mem::size_of::<Self>() - std::mem::size_of::<WalRecordHeader>();
         Self {
             page_header: WalRecordForPage::new(
                 WalRecordType::HeapInplaceUpdate,
                 page_id,
-                (4 + tuple_data.len()) as u16,
+                (struct_after_header + tuple_data.len()) as u16,
             ),
             tuple_offset,
             tuple_size: tuple_data.len() as u16,
@@ -488,11 +529,12 @@ pub struct WalHeapUpdateNewPage {
 impl WalHeapUpdateNewPage {
     /// 创建新的跨页更新记录（新页面）
     pub fn new(page_id: PageId, tuple_offset: u16, tuple_data: &[u8]) -> Self {
+        let struct_after_header = std::mem::size_of::<Self>() - std::mem::size_of::<WalRecordHeader>();
         Self {
             page_header: WalRecordForPage::new(
                 WalRecordType::HeapAnotherPageAppendUpdateNewPage,
                 page_id,
-                (4 + tuple_data.len()) as u16,
+                (struct_after_header + tuple_data.len()) as u16,
             ),
             tuple_offset,
             tuple_size: tuple_data.len() as u16,
@@ -529,11 +571,12 @@ pub struct WalHeapUpdateOldPage {
 impl WalHeapUpdateOldPage {
     /// 创建旧的页面更新记录
     pub fn new(page_id: PageId, tuple_offset: u16) -> Self {
+        let struct_after_header = std::mem::size_of::<Self>() - std::mem::size_of::<WalRecordHeader>();
         Self {
             page_header: WalRecordForPage::new(
                 WalRecordType::HeapAnotherPageAppendUpdateOldPage,
                 page_id,
-                (4 + 32) as u16,
+                (struct_after_header + 32) as u16,
             ),
             tuple_offset,
             header_size: 32,
@@ -561,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_wal_record_header_size() {
-        assert_eq!(std::mem::size_of::<WalRecordHeader>(), 4);
+        assert_eq!(std::mem::size_of::<WalRecordHeader>(), 8);
     }
 
     #[test]

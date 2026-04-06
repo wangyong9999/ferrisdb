@@ -84,10 +84,18 @@ impl UndoAction {
                 (4u8, *table_oid, *page_no, *tuple_offset, &[][..]),
         };
 
-        // WalRecordHeader(4) + xid(8) + type(1) + table_oid(4) + page_no(4) + offset(2) + data_len(4) + data
+        // WalRecordHeader + xid(8) + type(1) + table_oid(4) + page_no(4) + offset(2) + data_len(4) + data
         let payload_len = 8 + 1 + 4 + 4 + 2 + 4 + data.len();
+        let wal_type = match action_type {
+            0 => ferrisdb_storage::WalRecordType::UndoInsertRecord,
+            1 => ferrisdb_storage::WalRecordType::UndoDeleteRecord,
+            2 => ferrisdb_storage::WalRecordType::UndoUpdateRecord,
+            3 => ferrisdb_storage::WalRecordType::UndoUpdateOldPage,
+            4 => ferrisdb_storage::WalRecordType::UndoUpdateNewPage,
+            _ => ferrisdb_storage::WalRecordType::UndoInsertRecord,
+        };
         let header = ferrisdb_storage::wal::WalRecordHeader::new(
-            ferrisdb_storage::WalRecordType::UndoInsertRecord,
+            wal_type,
             payload_len as u16,
         );
         let header_size = std::mem::size_of::<ferrisdb_storage::wal::WalRecordHeader>();
@@ -291,6 +299,15 @@ impl Transaction {
         self.info.start_time.elapsed().as_millis() as u64 > self.timeout_ms
     }
 
+    /// 检查事务是否超时，超时则自动 abort 并返回错误
+    pub fn check_timeout(&mut self) -> ferrisdb_core::Result<()> {
+        if self.is_timed_out() {
+            let _ = self.abort();
+            return Err(FerrisDBError::Transaction(TransactionError::Timeout));
+        }
+        Ok(())
+    }
+
     /// 提交事务
     pub fn commit(&mut self) -> ferrisdb_core::Result<()> {
         if !self.active {
@@ -298,20 +315,16 @@ impl Transaction {
                 "Transaction is not active".to_string(),
             ));
         }
+        self.check_timeout()?;
 
         // 分配 CSN
         let manager = self.manager.get();
         let csn = manager.allocate_csn();
 
-        self.info.set_csn(csn);
-        self.info.set_state(TransactionState::Committed);
-
-        // 写 WAL commit record 并等待 fsync（保证 Durability）
-        // 与 C++ WaitTargetPlsnPersist 行为一致：
-        // 1. 写 commit record 到 OS page cache
-        // 2. 唤醒后台 flusher 立即 sync
-        // 3. 等待 flushed_lsn 追上 commit LSN
-        // 多个并发 commit 共享同一次 fsync = group commit
+        // 正确的 commit 顺序（WAL-first）：
+        // 1. 先写 WAL commit record（确保持久化）
+        // 2. 标记 active=false（防止 Drop 触发 abort）
+        // 3. 设 CSN 和状态（使其对其他事务可见）
         if let Some(ref writer) = self.wal_writer {
             let commit_rec = WalTxnCommit::new(self.info.xid, csn.raw());
             if let Ok(commit_lsn) = writer.write(&commit_rec.to_bytes()) {
@@ -319,11 +332,16 @@ impl Transaction {
             }
         }
 
+        // WAL 已持久化，先禁用 Drop 的 auto-abort（即使后续 panic 也不会回滚已提交事务）
+        self.active = false;
+
+        // 设置状态使其对其他事务可见
+        self.info.set_csn(csn);
+        self.info.set_state(TransactionState::Committed);
+
         // 写入无锁 CSN 查找表
         let slot_idx = self.info.xid.slot_id() as usize;
         manager.slot_csns[slot_idx].store(csn.raw(), Ordering::Release);
-
-        self.active = false;
 
         // 标记槽位为可重用
         let xid = self.info.xid;
@@ -368,7 +386,9 @@ impl Transaction {
     pub fn push_undo(&mut self, action: UndoAction) {
         if let Some(ref writer) = self.wal_writer {
             let wal_data = action.serialize_for_wal(self.info.xid);
-            let _ = writer.write(&wal_data);
+            if let Err(_e) = writer.write(&wal_data) {
+                // Undo WAL 写入失败：不阻塞 DML，但 crash 后无法回滚此操作
+            }
         }
         self.undo_log.push(action);
     }
@@ -575,6 +595,8 @@ pub struct TransactionManager {
     csn_allocator: CsnAllocator,
     /// 事务槽位
     slots: parking_lot::RwLock<Vec<Option<Arc<TransactionInfo>>>>,
+    /// 是否正在关闭（拒绝新事务）
+    is_shutdown: std::sync::atomic::AtomicBool,
     /// CSN 快速查找表（无锁）
     /// slot_csns[i] 存储事务 i 的 CSN，INVALID 表示未提交/未分配
     slot_csns: Vec<AtomicU64>,
@@ -601,11 +623,12 @@ impl TransactionManager {
         Self {
             csn_allocator: CsnAllocator::new(),
             slots: parking_lot::RwLock::new(slots),
+            is_shutdown: std::sync::atomic::AtomicBool::new(false),
             slot_csns,
             max_slots,
             buffer_pool: None,
             wal_writer: None,
-            txn_timeout_ms: 0,
+            txn_timeout_ms: 30_000, // 默认 30 秒
         }
     }
 
@@ -624,8 +647,11 @@ impl TransactionManager {
         self.wal_writer = Some(writer);
     }
 
-    /// 开始新事务
+    /// 开始新事务（关闭中时拒绝）
     pub fn begin(&self) -> ferrisdb_core::Result<Transaction> {
+        if self.is_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(FerrisDBError::InvalidState("Engine is shutting down".to_string()));
+        }
         // 合并快照收集和槽位分配到一次写锁中
         let info = {
             let mut slots = self.slots.write();
@@ -713,6 +739,59 @@ impl TransactionManager {
             }
         }
         Err(FerrisDBError::Transaction(TransactionError::NoFreeSlot))
+    }
+
+    /// 启动关闭序列：拒绝新事务
+    pub fn initiate_shutdown(&self) {
+        self.is_shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 等待所有活跃事务完成（最多 timeout_ms 毫秒）
+    /// 返回剩余活跃事务数（0 = 全部完成）
+    pub fn wait_for_all_transactions(&self, timeout_ms: u64) -> usize {
+        let start = std::time::Instant::now();
+        loop {
+            let slots = self.slots.read();
+            let active = slots.iter().filter(|s| {
+                s.as_ref().map_or(false, |info| info.state() == TransactionState::InProgress)
+            }).count();
+            if active == 0 {
+                return 0;
+            }
+            if start.elapsed().as_millis() as u64 >= timeout_ms {
+                return active;
+            }
+            drop(slots);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// 扫描并标记超时事务为 Aborted（后台线程调用）
+    /// 返回被强制 abort 的事务数
+    pub fn abort_timed_out_transactions(&self) -> usize {
+        if self.txn_timeout_ms == 0 { return 0; }
+        let slots = self.slots.read();
+        let mut aborted = 0;
+        for slot in slots.iter() {
+            if let Some(ref info) = slot {
+                if info.state() == TransactionState::InProgress
+                    && info.start_time.elapsed().as_millis() as u64 > self.txn_timeout_ms
+                {
+                    // 标记为 Aborted（Transaction::Drop 会跳过已非 active 的事务）
+                    info.set_state(TransactionState::Aborted);
+                    aborted += 1;
+                }
+            }
+        }
+        aborted
+    }
+
+    /// 获取当前活跃事务数
+    pub fn active_transaction_count(&self) -> usize {
+        let slots = self.slots.read();
+        slots.iter().filter(|s| {
+            s.as_ref().map_or(false, |info| info.state() == TransactionState::InProgress)
+        }).count()
     }
 
     /// 释放槽位

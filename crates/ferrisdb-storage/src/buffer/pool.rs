@@ -253,7 +253,9 @@ impl BufferPool {
 
         // 在锁外执行 I/O
         if need_flush {
-            let _ = self.flush_buffer(buf_id);
+            if let Err(e) = self.flush_buffer(buf_id) {
+                eprintln!("[buffer] eviction flush failed for buf_id {}: {:?}", buf_id, e);
+            }
         }
 
         // 读取新页面（alloc_lock 已释放，I/O 不阻塞其他线程）
@@ -363,7 +365,7 @@ impl BufferPool {
                         let mut fpw_buf = Vec::with_capacity(hdr_bytes.len() + PAGE_SIZE);
                         fpw_buf.extend_from_slice(hdr_bytes);
                         fpw_buf.extend_from_slice(page_slice);
-                        let _ = wal_writer.write(&fpw_buf);
+                        wal_writer.write(&fpw_buf)?;
                     }
                 }
 
@@ -630,6 +632,32 @@ impl<'a> PinnedBuffer<'a> {
 impl Drop for PinnedBuffer<'_> {
     fn drop(&mut self) {
         self.pool.unpin(self.buf_id);
+    }
+}
+
+/// BufferPool 实现 DirtyPageFlusher trait，供 CheckpointManager 使用
+impl crate::wal::DirtyPageFlusher for BufferPool {
+    fn flush_dirty_pages(&self, _up_to_lsn: ferrisdb_core::Lsn) -> Result<u64> {
+        let mut flushed = 0u64;
+        for (i, desc) in self.buffers.iter().enumerate() {
+            if desc.is_dirty() {
+                self.flush_buffer(i as BufId)?;
+                flushed += 1;
+            }
+        }
+        // fsync 所有数据文件，确保脏页真正落盘
+        if let Some(ref smgr) = self.smgr {
+            let _ = smgr.sync_all();
+        }
+        Ok(flushed)
+    }
+
+    fn dirty_page_count(&self) -> u64 {
+        self.dirty_page_count() as u64
+    }
+
+    fn total_page_count(&self) -> u64 {
+        self.total_page_count() as u64
     }
 }
 

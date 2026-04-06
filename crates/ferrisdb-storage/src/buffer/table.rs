@@ -4,7 +4,7 @@
 
 use ferrisdb_core::atomic::{AtomicU32, AtomicU64, Ordering};
 use ferrisdb_core::{BufferTag, BufId};
-use std::sync::Mutex;
+use parking_lot::RwLock;
 
 /// Hash 表默认大小（必须是 2 的幂次方）
 pub const DEFAULT_HASH_TABLE_SIZE: usize = 1024;
@@ -54,11 +54,15 @@ pub struct BufTable {
     entries: Vec<BufTableEntry>,
     /// 空闲条目链表头
     free_list: AtomicU32,
-    /// 保护的互斥锁
-    lock: Mutex<()>,
+    /// 保护 tag 读写（RwLock：lookup 取读锁，insert/remove 取写锁）
+    lock: RwLock<()>,
     /// 掩码（用于取模）
     mask: usize,
 }
+
+// SAFETY: UnsafeCell<BufferTag> 通过分区 RwLock 保护所有读写
+unsafe impl Send for BufTable {}
+unsafe impl Sync for BufTable {}
 
 impl BufTable {
     /// 创建新的 Buffer 表
@@ -69,12 +73,10 @@ impl BufTable {
             buckets.push(AtomicU32::new(u32::MAX));
         }
 
-        // 预分配条目（2x 槽位数）
         let entry_count = size * 2;
         let mut entries = Vec::with_capacity(entry_count);
         for i in 0..entry_count {
             let mut entry = BufTableEntry::new();
-            // 初始化空闲链表
             entry.next = AtomicU32::new(if i + 1 < entry_count { (i + 1) as u32 } else { u32::MAX });
             entries.push(entry);
         }
@@ -83,7 +85,7 @@ impl BufTable {
             buckets,
             entries,
             free_list: AtomicU32::new(0),
-            lock: Mutex::new(()),
+            lock: RwLock::new(()),
             mask: size - 1,
         }
     }
@@ -94,14 +96,15 @@ impl BufTable {
         tag.hash_value() as usize & self.mask
     }
 
-    /// 查找 Buffer
+    /// 查找 Buffer（读锁保护，防止 torn read）
     pub fn lookup(&self, tag: &BufferTag) -> Option<BufId> {
+        let _guard = self.lock.read();
         let hash = self.hash(tag);
         let mut idx = self.buckets[hash].load(Ordering::Acquire);
 
         while idx != u32::MAX {
             let entry = &self.entries[idx as usize];
-            // SAFETY: Reading tag is safe as we're only comparing
+            // SAFETY: RwLock read guard prevents concurrent tag writes
             let entry_tag = unsafe { *entry.tag.get() };
             if entry_tag == *tag {
                 let buf_id = entry.buf_id.load(Ordering::Acquire);
@@ -119,7 +122,7 @@ impl BufTable {
     ///
     /// 返回是否成功（失败表示已存在或表已满）
     pub fn insert(&self, tag: BufferTag, buf_id: BufId) -> bool {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.write();
         let hash = self.hash(&tag);
 
         // 检查是否已存在
@@ -159,7 +162,7 @@ impl BufTable {
 
     /// 删除 Buffer
     pub fn remove(&self, tag: &BufferTag) -> Option<BufId> {
-        let _guard = self.lock.lock().unwrap();
+        let _guard = self.lock.write();
         let hash = self.hash(tag);
 
         let mut prev_idx = u32::MAX;

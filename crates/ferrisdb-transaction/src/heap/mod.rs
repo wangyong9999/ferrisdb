@@ -206,16 +206,23 @@ impl HeapTable {
         Ok(())
     }
 
-    /// FSM: 查找有足够空闲空间的页（无锁）
+    /// FSM: 查找有足够空闲空间的页（无锁，roving pointer 避免线性扫描）
     fn fsm_find_page(&self, needed: u16) -> Option<u32> {
         let threshold = if needed >= 8192 { 0 } else { 255 - (needed as u32 * 255 / 8192) as u8 };
         let max = self.fsm_max_page.load(std::sync::atomic::Ordering::Acquire) as usize;
-        for i in 0..max.min(self.fsm.len()) {
+        if max == 0 { return None; }
+        let len = max.min(self.fsm.len());
+        // 从上次成功位置附近开始搜索（last_page - 1），最多搜索 8 页
+        let current = self.current_page.load(std::sync::atomic::Ordering::Acquire) as usize;
+        let start = if current > 0 { current - 1 } else { 0 };
+        let search_limit = 8.min(len);
+        for offset in 0..search_limit {
+            let i = (start + offset) % len;
             if self.fsm[i].load(std::sync::atomic::Ordering::Relaxed) >= threshold {
                 return Some(i as u32);
             }
         }
-        None
+        None // 8 页内没找到就放弃，走 allocate new page 路径
     }
 
     /// FSM: 更新页面空闲空间等级（无锁）
@@ -248,13 +255,15 @@ impl HeapTable {
     /// 写入 WAL 记录
     ///
     /// 优先写 WalWriter（磁盘持久化），回退到 WalBuffer（内存）。
+    /// 错误必须传播——静默丢弃会导致已提交数据在 crash 后丢失。
     #[inline]
-    fn wal_write(&self, record_data: &[u8]) {
+    fn wal_write(&self, record_data: &[u8]) -> ferrisdb_core::Result<()> {
         if let Some(ref writer) = self.wal_writer {
-            let _ = writer.write(record_data);
+            writer.write(record_data)?;
         } else if let Some(ref buf) = self.wal_buffer {
-            let _ = buf.write(record_data);
+            buf.write(record_data)?;
         }
+        Ok(())
     }
 
     /// 插入元组
@@ -303,7 +312,7 @@ impl HeapTable {
                         tuple_buf.extend_from_slice(data);
                         let page_id = self.make_page_id(last_page);
                         let wal_rec = WalHeapInsert::new(page_id, offset, &tuple_buf);
-                        self.wal_write(&wal_rec.serialize_with_data(&tuple_buf));
+                        self.wal_write(&wal_rec.serialize_with_data(&tuple_buf))?;
 
                         // Undo: 记录插入，回滚时标记为 dead
                         if let Some(txn) = txn {
@@ -345,7 +354,7 @@ impl HeapTable {
         tuple_buf.extend_from_slice(data);
         let page_id = self.make_page_id(new_page_no);
         let wal_rec = WalHeapInsert::new(page_id, offset, &tuple_buf);
-        self.wal_write(&wal_rec.serialize_with_data(&tuple_buf));
+        self.wal_write(&wal_rec.serialize_with_data(&tuple_buf))?;
 
         // Undo
         if let Some(txn) = txn {
@@ -433,7 +442,7 @@ impl HeapTable {
                 };
                 let page_id = self.make_page_id(tid.ip_blkid);
                 let wal_rec = WalHeapInplaceUpdate::new(page_id, tid.ip_posid, &updated_data);
-                self.wal_write(&wal_rec.serialize_with_data(&updated_data));
+                self.wal_write(&wal_rec.serialize_with_data(&updated_data))?;
 
                 drop(_lock);
                 pinned.mark_dirty();
@@ -491,9 +500,9 @@ impl HeapTable {
 
                     let old_page_id = self.make_page_id(tid.ip_blkid);
                     let wal_old = WalHeapUpdateOldPage::new(old_page_id, tid.ip_posid);
-                    self.wal_write(&wal_old.serialize_with_header(&updated_old_header));
+                    self.wal_write(&wal_old.serialize_with_header(&updated_old_header))?;
                     let wal_new = WalHeapInsert::new(old_page_id, offset, &tuple_data);
-                    self.wal_write(&wal_new.serialize_with_data(&tuple_data));
+                    self.wal_write(&wal_new.serialize_with_data(&tuple_data))?;
 
                     drop(_lock);
                     pinned.mark_dirty();
@@ -523,7 +532,7 @@ impl HeapTable {
             // WAL: old page xmax set
             let old_page_id = self.make_page_id(tid.ip_blkid);
             let wal_old = WalHeapUpdateOldPage::new(old_page_id, tid.ip_posid);
-            self.wal_write(&wal_old.serialize_with_header(&updated_old_header));
+            self.wal_write(&wal_old.serialize_with_header(&updated_old_header))?;
 
             // Undo for cross-page: old page header restore
             if txn.is_some() {
@@ -558,13 +567,14 @@ impl HeapTable {
 
             let new_page_id = self.make_page_id(new_page_no);
             let wal_new = WalHeapUpdateNewPage::new(new_page_id, new_offset, &tuple_data);
-            self.wal_write(&wal_new.serialize_with_data(&tuple_data));
+            self.wal_write(&wal_new.serialize_with_data(&tuple_data))?;
 
             drop(_new_lock);
         }
         new_pinned.mark_dirty();
 
         // Update old tuple's ctid to point to new version (cross-page forward chain)
+        // + WAL record for ctid update (防止 crash 后 ctid 链断裂)
         {
             let old_pinned = self.buffer_pool.pin(&self.make_tag(tid.ip_blkid))?;
             let _old_lock = old_pinned.lock_exclusive();
@@ -573,6 +583,11 @@ impl HeapTable {
                 let new_ctid = TupleId::new(new_page_no, new_offset);
                 old_tuple[24..28].copy_from_slice(&new_ctid.ip_blkid.to_le_bytes());
                 old_tuple[28..30].copy_from_slice(&new_ctid.ip_posid.to_le_bytes());
+
+                // WAL: 记录 old page ctid 更新（header 的 32 字节包含 ctid）
+                let old_page_id = self.make_page_id(tid.ip_blkid);
+                let wal_ctid = WalHeapUpdateOldPage::new(old_page_id, tid.ip_posid);
+                self.wal_write(&wal_ctid.serialize_with_header(&old_tuple[..32]))?;
             }
             drop(_old_lock);
             old_pinned.mark_dirty();
@@ -638,7 +653,7 @@ impl HeapTable {
         // WAL
         let page_id = self.make_page_id(tid.ip_blkid);
         let wal_rec = WalHeapDelete::new(page_id, tid.ip_posid);
-        self.wal_write(&wal_rec.to_bytes());
+        self.wal_write(&wal_rec.to_bytes())?;
 
         drop(_lock);
         pinned.mark_dirty();

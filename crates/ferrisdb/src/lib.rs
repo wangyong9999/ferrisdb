@@ -26,7 +26,7 @@ pub mod engine;
 pub mod managed_table;
 
 // Re-export the primary API
-pub use engine::{Engine, EngineConfig};
+pub use engine::{Engine, EngineConfig, EngineStats};
 pub use managed_table::{ManagedTable, IndexDef};
 
 // Re-export commonly needed types from lower crates

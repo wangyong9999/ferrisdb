@@ -107,14 +107,26 @@ impl ControlFile {
         self.data.read().clone()
     }
 
-    /// 持久化到磁盘（原子写: 写临时文件 → rename）
+    /// 持久化到磁盘（原子写: 写临时文件 → fsync → rename → fsync 父目录）
     fn flush(&self) -> Result<()> {
         let bytes = self.data.read().to_bytes();
         let tmp_path = self.path.with_extension("tmp");
-        fs::write(&tmp_path, bytes)
+        // 写临时文件
+        fs::write(&tmp_path, &bytes)
             .map_err(|e| FerrisDBError::Internal(format!("Failed to write control file: {}", e)))?;
+        // fsync 临时文件（确保数据落盘后再 rename）
+        fs::File::open(&tmp_path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| FerrisDBError::Internal(format!("Failed to fsync control file: {}", e)))?;
+        // 原子 rename
         fs::rename(&tmp_path, &self.path)
             .map_err(|e| FerrisDBError::Internal(format!("Failed to rename control file: {}", e)))?;
+        // fsync 父目录（确保 rename 持久化）
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 }

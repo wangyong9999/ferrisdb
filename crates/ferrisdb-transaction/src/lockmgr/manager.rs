@@ -1,24 +1,23 @@
 //! Lock Manager
 //!
-//! 锁管理器实现。使用 Condvar 等待/唤醒机制替代 busy-spin。
+//! 锁管理器实现。使用 parking_lot Condvar + 超时退避避免 livelock。
 
 use super::lock::{Lock, LockMode, LockTag};
 use ferrisdb_core::Xid;
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashMap;
-use std::sync::{Condvar, Mutex};
 
 /// 锁管理器
 ///
 /// 管理所有重量级锁。
-/// 使用 Condvar 等待机制，释放锁时唤醒等待者。
+/// 使用 parking_lot Condvar 等待机制，释放锁时唤醒等待者。
 pub struct LockManager {
     /// 锁表
     locks: RwLock<HashMap<LockTag, Lock>>,
     /// 死锁检测器
     deadlock_detector: super::deadlock::DeadlockDetector,
-    /// 等待通知机制
-    wait_notify: Mutex<()>,
+    /// 等待通知机制（parking_lot，与 locks 的 RwLock 同系避免混用问题）
+    wait_state: Mutex<()>,
     wait_condvar: Condvar,
 }
 
@@ -28,7 +27,7 @@ impl LockManager {
         Self {
             locks: RwLock::new(HashMap::new()),
             deadlock_detector: super::deadlock::DeadlockDetector::new(),
-            wait_notify: Mutex::new(()),
+            wait_state: Mutex::new(()),
             wait_condvar: Condvar::new(),
         }
     }
@@ -37,35 +36,29 @@ impl LockManager {
     ///
     /// 如果获取失败，会等待直到获取或检测到死锁。
     pub fn acquire(&self, tag: LockTag, mode: LockMode, xid: Xid) -> ferrisdb_core::Result<()> {
-        // 检查是否已存在
+        // 快速路径：锁已存在，尝试获取
         {
             let locks = self.locks.read();
             if let Some(lock) = locks.get(&tag) {
-                let _guard = lock.lock.lock().unwrap();
                 if lock.try_acquire(mode) {
                     lock.set_holder(xid);
                     return Ok(());
                 }
-                // 需要等待
                 let holder = lock.holder();
-                drop(_guard);
                 drop(locks);
                 return self.wait_for_lock(&tag, mode, xid, holder);
             }
         }
 
-        // 创建新锁
+        // 慢速路径：创建新锁
         {
             let mut locks = self.locks.write();
-            // 双重检查
             if let Some(lock) = locks.get(&tag) {
-                let _guard = lock.lock.lock().unwrap();
                 if lock.try_acquire(mode) {
                     lock.set_holder(xid);
                     return Ok(());
                 }
                 let holder = lock.holder();
-                drop(_guard);
                 drop(locks);
                 return self.wait_for_lock(&tag, mode, xid, holder);
             }
@@ -83,7 +76,6 @@ impl LockManager {
     pub fn try_acquire(&self, tag: &LockTag, mode: LockMode) -> bool {
         let locks = self.locks.read();
         if let Some(lock) = locks.get(tag) {
-            let _guard = lock.lock.lock().unwrap();
             lock.try_acquire(mode)
         } else {
             false
@@ -94,20 +86,18 @@ impl LockManager {
     pub fn release(&self, tag: &LockTag) -> ferrisdb_core::Result<()> {
         let locks = self.locks.read();
         if let Some(lock) = locks.get(tag) {
-            let _guard = lock.lock.lock().unwrap();
             lock.release();
             lock.clear_holder();
-            drop(_guard);
-
-            // 唤醒所有等待者
-            self.wait_condvar.notify_all();
+            drop(locks);
+            // 唤醒一个等待者（避免惊群）
+            self.wait_condvar.notify_one();
             Ok(())
         } else {
             Err(ferrisdb_core::FerrisDBError::Lock(ferrisdb_core::error::LockError::NotHeld))
         }
     }
 
-    /// 等待锁 — 使用 Condvar 等待/唤醒
+    /// 等待锁
     fn wait_for_lock(
         &self,
         tag: &LockTag,
@@ -115,60 +105,52 @@ impl LockManager {
         xid: Xid,
         blocking_xid: Option<Xid>,
     ) -> ferrisdb_core::Result<()> {
-        // 注册等待关系（用于死锁检测）
         if let Some(blocker) = blocking_xid {
             self.deadlock_detector.add_wait(xid, blocker);
         }
 
-        let result = self.wait_for_lock_inner(tag, mode, xid);
-
-        // 清理等待关系
-        self.deadlock_detector.remove_wait(xid);
-
-        result
-    }
-
-    fn wait_for_lock_inner(
-        &self,
-        tag: &LockTag,
-        mode: LockMode,
-        xid: Xid,
-    ) -> ferrisdb_core::Result<()> {
-        let mut guard = self.wait_notify.lock().unwrap();
-
+        let mut attempts = 0u32;
         loop {
-            // 检查死锁
+            // 死锁检测
             if self.deadlock_detector.check_deadlock(xid) {
+                self.deadlock_detector.remove_wait(xid);
                 return Err(ferrisdb_core::FerrisDBError::Lock(
                     ferrisdb_core::error::LockError::Deadlock,
                 ));
             }
 
-            // 尝试获取锁
+            // 尝试获取
             {
                 let locks = self.locks.read();
                 if let Some(lock) = locks.get(tag) {
-                    let _lock_guard = lock.lock.lock().unwrap();
                     if lock.try_acquire(mode) {
                         lock.set_holder(xid);
-                        // 更新 deadlock detector 中的等待关系
+                        self.deadlock_detector.remove_wait(xid);
                         return Ok(());
                     }
-                    // 更新等待对象（holder 可能变了）
                     if let Some(new_blocker) = lock.holder() {
                         self.deadlock_detector.remove_wait(xid);
                         self.deadlock_detector.add_wait(xid, new_blocker);
                     }
                 } else {
-                    // 锁已被删除，不再需要等待
+                    self.deadlock_detector.remove_wait(xid);
                     return Ok(());
                 }
             }
 
-            // 等待唤醒，带超时防止永久阻塞
-            let timeout = std::time::Duration::from_millis(10);
-            let (new_guard, _) = self.wait_condvar.wait_timeout(guard, timeout).unwrap();
-            guard = new_guard;
+            // 等待：Condvar + 超时（指数退避，1ms → 2ms → 4ms → 最大 10ms）
+            let wait_ms = std::cmp::min(1u64 << attempts.min(3), 10);
+            let mut guard = self.wait_state.lock();
+            self.wait_condvar.wait_for(&mut guard, std::time::Duration::from_millis(wait_ms));
+            attempts += 1;
+
+            // 安全阀：超过 5000 次重试 = 超时
+            if attempts > 5000 {
+                self.deadlock_detector.remove_wait(xid);
+                return Err(ferrisdb_core::FerrisDBError::Lock(
+                    ferrisdb_core::error::LockError::Timeout,
+                ));
+            }
         }
     }
 

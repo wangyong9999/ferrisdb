@@ -362,7 +362,9 @@ impl CheckpointManager {
                 }
 
                 if manager.need_checkpoint() {
-                    let _ = manager.checkpoint(CheckpointType::Online);
+                    if let Err(e) = manager.checkpoint(CheckpointType::Online) {
+                        eprintln!("[checkpoint] auto checkpoint failed: {:?}", e);
+                    }
                 }
 
                 // 休眠一段时间

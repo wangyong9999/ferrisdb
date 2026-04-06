@@ -13,21 +13,24 @@ FerrisDB achieves **3x+ throughput** over the reference C++ implementation on st
 - **Full ACID Transactions** — WAL-based durability with synchronous commit and group commit
 - **MVCC Snapshot Isolation** — Lock-free reads with point-in-time consistent snapshots
 - **Crash Recovery** — WAL redo + automatic undo rollback of uncommitted transactions
-- **B+Tree Indexes** — Concurrent insert/delete/scan with page split, merge, and recycling
-- **Data Integrity** — Page CRC32C, WAL CRC, torn page detection, full-page writes
-- **Production Infrastructure** — Runtime configuration (GUC), structured logging, performance statistics, numeric error codes
+- **B+Tree Indexes** — Concurrent insert/delete/scan with page split and right-link traversal
+- **Data Integrity** — Page CRC32C, WAL CRC32, torn page detection, full-page writes
+- **Automatic Checkpoint** — Periodic dirty page flush + WAL truncation (configurable interval)
+- **AutoVacuum** — Background dead tuple reclamation with transaction timeout enforcement
+- **Graceful Shutdown** — Wait for in-flight transactions, final checkpoint, fsync all data files
+- **Production Infrastructure** — Runtime configuration (GUC), error logging, `EngineStats` monitoring API
 
 ## Performance
 
 Full TPC-C benchmark with all 5 transaction types (NewOrder 45%, Payment 43%, OrderStatus 4%, Delivery 4%, StockLevel 4%):
 
-| Workload | FerrisDB | Reference C++ | Ratio |
-|----------|----------|---------------|-------|
-| TPC-C 20W / 16 threads | 4,595 TPS | ~1,451 TPS | **3.2x** |
-| TPC-C 5W / 8 threads | 7,395 TPS | — | Peak throughput |
-| TPC-C 5W / 4 threads | 5,873 TPS | — | — |
+| Workload | TPS | Buffer Pool | Notes |
+|----------|-----|-------------|-------|
+| TPC-C 1W / 1T | 3,473 | 100K pages | Single-thread baseline |
+| TPC-C 5W / 16T | 4,583 | 100K pages | Peak concurrent throughput |
+| TPC-C 20W / 20T | 3,100–3,300 | 300K pages | Standard config, 99.8% hit rate |
 
-*Measured on WSL2 / x86_64 / 16 GB RAM. Buffer pool 100K pages, 10s duration.*
+*Measured on WSL2 / x86_64 / 16 GB RAM. Duration 20–60s.*
 
 ## Architecture
 
@@ -35,6 +38,10 @@ Full TPC-C benchmark with all 5 transaction types (NewOrder 45%, Payment 43%, Or
 ┌─────────────────────────────────────────────────────┐
 │                   ferrisdb-bench                     │
 │              TPC-C Benchmark (5 txn types)           │
+├─────────────────────────────────────────────────────┤
+│                      ferrisdb                        │
+│  Engine · ManagedTable · Checkpoint · AutoVacuum     │
+│  Shutdown · EngineStats · DDL · register_table()     │
 ├─────────────────────────────────────────────────────┤
 │                ferrisdb-transaction                   │
 │    HeapTable · Transaction · MVCC · Undo · Lock Mgr  │
@@ -48,12 +55,13 @@ Full TPC-C benchmark with all 5 transaction types (NewOrder 45%, Payment 43%, Or
 └─────────────────────────────────────────────────────┘
 ```
 
-| Crate | Lines | Description |
-|-------|-------|-------------|
-| `ferrisdb-core` | 5.1K | Primitive types (Xid, CSN, LSN), lock primitives (LWLock, ContentLock, SpinLock), GUC configuration, logging framework, statistics collection |
-| `ferrisdb-storage` | 14.5K | Buffer pool with LRU eviction, B+Tree index with WAL integration, write-ahead log with recovery, page management with checksums, storage manager, tablespace/segment, LOB, parallel scan |
-| `ferrisdb-transaction` | 4.7K | Transaction lifecycle, MVCC visibility, undo-based rollback, savepoints, heap table DML, deadlock detection, lock manager with Condvar signaling |
-| `ferrisdb-bench` | 2.0K | Full TPC-C implementation matching the reference C++ benchmark |
+| Crate | Description |
+|-------|-------------|
+| `ferrisdb` | Engine facade: lifecycle (open/shutdown), checkpoint scheduling, autovacuum, transaction timeout enforcement, DDL, `EngineStats` monitoring API |
+| `ferrisdb-core` | Primitive types (Xid, CSN, LSN), lock primitives (LWLock, ContentLock, SpinLock), GUC configuration, statistics |
+| `ferrisdb-storage` | Buffer pool with LRU eviction, B+Tree with WAL, write-ahead log with CRC32 and recovery, page management, storage manager, tablespace/segment |
+| `ferrisdb-transaction` | Transaction lifecycle, MVCC visibility, undo-based rollback, savepoints, heap table DML, deadlock detection, lock manager |
+| `ferrisdb-bench` | Full TPC-C implementation (5 transaction types, configurable warehouses/threads/WAL mode) |
 
 ## Quick Start
 
@@ -61,7 +69,7 @@ Full TPC-C benchmark with all 5 transaction types (NewOrder 45%, Payment 43%, Or
 # Build
 cargo build --release
 
-# Run all 916 tests
+# Run all 1016 tests
 cargo test --all
 
 # TPC-C benchmark (in-memory mode)
@@ -121,8 +129,10 @@ cargo run --release --bin tpcc -- \
 1. **Scan** — discover WAL files, locate last checkpoint
 2. **Redo** — replay heap and B-Tree WAL records (LSN-based idempotency)
 3. **Undo** — collect uncommitted transactions from WAL, rollback via undo actions
-4. **Flush** — write recovered pages to disk
-5. **Control file** — persist checkpoint LSN with CRC for next startup
+4. **Flush** — write recovered pages to disk, fsync all data files
+5. **Control file** — atomic write with fsync, persist checkpoint LSN
+
+End-to-end verified: committed data survives crash, uncommitted data is rolled back.
 
 ### Configuration (GUC)
 
@@ -133,7 +143,7 @@ shared_buffers = 50000           # Buffer pool size in pages (400 MB)
 wal_buffers = 16384              # WAL buffer size in bytes
 synchronous_commit = true        # Wait for WAL fsync on commit
 checkpoint_interval_ms = 60000   # Checkpoint interval
-transaction_timeout_ms = 0       # Transaction timeout (0 = disabled)
+transaction_timeout_ms = 30000   # Transaction timeout (default 30s)
 log_level = 3                    # 0=OFF, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG
 bgwriter_delay_ms = 200          # Background writer interval
 bgwriter_max_pages = 100         # Max pages per background write round
@@ -144,19 +154,21 @@ max_connections = 64             # Max concurrent transaction slots
 
 ## Testing
 
-916 tests organized by subsystem:
+1,016 tests organized by subsystem:
 
 ```bash
 cargo test -p ferrisdb-core         # 117 tests: locks, atomics, config, logging, stats
-cargo test -p ferrisdb-storage      # 560 tests: buffer, B-Tree, WAL, pages, recovery, segments
-cargo test -p ferrisdb-transaction  # 239 tests: transactions, heap, MVCC, undo, savepoints
+cargo test -p ferrisdb-storage      # 585 tests: buffer, B-Tree, WAL, pages, recovery, CRC, checkpoint
+cargo test -p ferrisdb-transaction  # 233 tests: transactions, heap, MVCC, undo, crash recovery e2e
+cargo test -p ferrisdb              #  81 tests: engine, managed table, DDL, expression index
 ```
 
 Test categories include:
 - Unit tests for every module (inline `#[cfg(test)]`)
 - Integration tests for DML, crash recovery, WAL roundtrip
-- Concurrent stress tests (4–16 threads)
-- Fault injection (checksum corruption, torn pages, pool exhaustion)
+- End-to-end crash recovery tests (committed/uncommitted/mixed scenarios)
+- Concurrent stress tests (4–16 threads, 30x stability verified)
+- Fault injection (CRC corruption, torn pages, pool exhaustion)
 - Edge cases (empty keys, max-size tuples, boundary conditions)
 
 ## Design Decisions

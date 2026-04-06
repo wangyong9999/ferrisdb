@@ -17,6 +17,21 @@ use super::writer::{WalFileHeader, WAL_FILE_MAGIC};
 use crate::page::{PAGE_SIZE, HeapPage};
 use crate::smgr::StorageManager;
 
+/// 对齐的页面缓冲区（8192 字节对齐，供 HeapPage::from_bytes 使用）
+#[repr(C, align(8192))]
+struct AlignedPageBuf {
+    data: [u8; PAGE_SIZE],
+}
+
+impl AlignedPageBuf {
+    fn from_vec(src: &[u8]) -> Self {
+        let mut buf = Self { data: [0u8; PAGE_SIZE] };
+        let len = src.len().min(PAGE_SIZE);
+        buf.data[..len].copy_from_slice(&src[..len]);
+        buf
+    }
+}
+
 /// 恢复模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryMode {
@@ -519,6 +534,14 @@ impl WalRecovery {
                 }
             }
 
+            // CRC 校验：检测静默数据腐败或部分写入
+            if record_header.crc != 0 {
+                if !record_header.verify_crc(&record_data) {
+                    // CRC 不匹配 → torn write 或数据腐败，停止 replay
+                    break;
+                }
+            }
+
             if let Some(rtype) = record_header.record_type() {
                 let result = if let Some(ctx) = redo_ctx.as_mut() {
                     self.redo_record(rtype, current_lsn, &record_data, ctx)?
@@ -616,7 +639,11 @@ impl WalRecovery {
             WalRecordType::NextCsn | WalRecordType::BarrierCsn => Ok(true),
 
             // ===== Undo 记录 =====
-            WalRecordType::UndoInsertRecord => {
+            WalRecordType::UndoInsertRecord
+            | WalRecordType::UndoDeleteRecord
+            | WalRecordType::UndoUpdateRecord
+            | WalRecordType::UndoUpdateOldPage
+            | WalRecordType::UndoUpdateNewPage => {
                 // 收集 undo actions 用于回滚未提交事务
                 // 格式: [WalRecordHeader][xid:8][type:1][table_oid:4][page_no:4][offset:2][data_len:4][data]
                 let hdr_size = std::mem::size_of::<WalRecordHeader>();
@@ -639,6 +666,30 @@ impl WalRecovery {
                     if xid > 0 {
                         let action = RecoveryUndoAction { action_type, table_oid, page_no, tuple_offset, data: undo_data };
                         ctx.txn_undo_actions.entry(xid).or_default().push(action);
+                    }
+                }
+                Ok(true)
+            }
+
+            // DDL WAL 记录 — catalog 持久化已独立处理，redo 阶段标记为已处理
+            WalRecordType::DdlCreate | WalRecordType::DdlDrop => {
+                // DDL 操作的持久化由 SystemCatalog::persist() 保证。
+                // Recovery 时 catalog 从 ferrisdb_catalog 文件重建，
+                // 不需要从 WAL 重放 DDL（与 C++ 的 catalog WAL redo 不同）。
+                Ok(true)
+            }
+
+            // Full-page write — 恢复 torn page
+            WalRecordType::HeapPageFull => {
+                // FPW payload 是完整的 8KB 页面，直接覆盖磁盘页面
+                if data.len() >= std::mem::size_of::<WalRecordForPage>() {
+                    let (page_rec, payload) = match Self::parse_page_record(data) {
+                        Some(r) => r,
+                        None => return Ok(false),
+                    };
+                    if payload.len() >= PAGE_SIZE {
+                        let page_id = page_rec.page_id;
+                        ctx.write_page(page_id, payload[..PAGE_SIZE].to_vec());
                     }
                 }
                 Ok(true)
@@ -731,9 +782,9 @@ impl WalRecovery {
             return Ok(false);
         }
 
-        // 将元组数据直接写入页面指定位置
-        let mut page_buf = page_data;
-        let heap_page = HeapPage::from_bytes(&mut page_buf);
+        // 使用对齐缓冲区（HeapPage 需要 8192 字节对齐）
+        let mut aligned = AlignedPageBuf::from_vec(&page_data);
+        let heap_page = HeapPage::from_bytes(&mut aligned.data);
 
         // 如果是全零页面（新创建的页面），先初始化页面头部
         if heap_page.header().base.pd_upper == 0 {
@@ -743,12 +794,12 @@ impl WalRecovery {
         // 插入元组到页面
         let tuple_bytes = &tuple_data[..tuple_size as usize];
         if heap_page.insert_tuple(tuple_bytes).is_some() {
-            Self::finish_redo(ctx, page_id, record_lsn, page_buf);
+            Self::finish_redo(ctx, page_id, record_lsn, aligned.data.to_vec());
             return Ok(true);
         }
 
         // 插入失败（空间不足），仍然标记页面 LSN
-        Self::finish_redo(ctx, page_id, record_lsn, page_buf);
+        Self::finish_redo(ctx, page_id, record_lsn, aligned.data.to_vec());
         Ok(true)
     }
 
@@ -777,11 +828,11 @@ impl WalRecovery {
         let tuple_offset = u16::from_le_bytes([payload[0], payload[1]]);
 
         // 标记元组为 dead
-        let mut page_buf = page_data;
-        let heap_page = HeapPage::from_bytes(&mut page_buf);
+        let mut aligned = AlignedPageBuf::from_vec(&page_data);
+        let heap_page = HeapPage::from_bytes(&mut aligned.data);
         heap_page.mark_dead(tuple_offset);
 
-        Self::finish_redo(ctx, page_id, record_lsn, page_buf);
+        Self::finish_redo(ctx, page_id, record_lsn, aligned.data.to_vec());
         Ok(true)
     }
 
@@ -816,15 +867,15 @@ impl WalRecovery {
         }
 
         // 直接覆盖元组数据
-        let mut page_buf = page_data;
-        let heap_page = HeapPage::from_bytes(&mut page_buf);
+        let mut aligned = AlignedPageBuf::from_vec(&page_data);
+        let heap_page = HeapPage::from_bytes(&mut aligned.data);
 
         if let Some(existing) = heap_page.get_tuple_mut(tuple_offset) {
             let copy_len = (tuple_size as usize).min(existing.len());
             existing[..copy_len].copy_from_slice(&tuple_data[..copy_len]);
         }
 
-        Self::finish_redo(ctx, page_id, record_lsn, page_buf);
+        Self::finish_redo(ctx, page_id, record_lsn, aligned.data.to_vec());
         Ok(true)
     }
 
@@ -881,15 +932,15 @@ impl WalRecovery {
         }
 
         // 更新旧元组的头部（设置 xmax 等）
-        let mut page_buf = page_data;
-        let heap_page = HeapPage::from_bytes(&mut page_buf);
+        let mut aligned = AlignedPageBuf::from_vec(&page_data);
+        let heap_page = HeapPage::from_bytes(&mut aligned.data);
 
         if let Some(existing) = heap_page.get_tuple_mut(tuple_offset) {
             let copy_len = (header_size as usize).min(existing.len());
             existing[..copy_len].copy_from_slice(&header_data[..copy_len]);
         }
 
-        Self::finish_redo(ctx, page_id, record_lsn, page_buf);
+        Self::finish_redo(ctx, page_id, record_lsn, aligned.data.to_vec());
         Ok(true)
     }
 
@@ -912,11 +963,11 @@ impl WalRecovery {
         };
 
         // 执行页面压缩
-        let mut page_buf = page_data;
-        let heap_page = HeapPage::from_bytes(&mut page_buf);
+        let mut aligned = AlignedPageBuf::from_vec(&page_data);
+        let heap_page = HeapPage::from_bytes(&mut aligned.data);
         heap_page.compact_dead();
 
-        Self::finish_redo(ctx, page_id, record_lsn, page_buf);
+        Self::finish_redo(ctx, page_id, record_lsn, aligned.data.to_vec());
         Ok(true)
     }
 
@@ -1116,8 +1167,9 @@ impl WalRecovery {
     fn apply_recovery_undo(&self, action: &RecoveryUndoAction, ctx: &mut RedoContext) -> Result<()> {
         let page_id = ferrisdb_core::PageId::new(0, 0, action.table_oid, action.page_no);
 
-        let mut page_data = ctx.read_page(&page_id)?;
-        let heap_page = HeapPage::from_bytes(&mut page_data);
+        let page_data = ctx.read_page(&page_id)?;
+        let mut aligned = AlignedPageBuf::from_vec(&page_data);
+        let heap_page = HeapPage::from_bytes(&mut aligned.data);
 
         match action.action_type {
             0 => {
@@ -1148,7 +1200,7 @@ impl WalRecovery {
             _ => {}
         }
 
-        ctx.write_page(page_id, page_data);
+        ctx.write_page(page_id, aligned.data.to_vec());
         Ok(())
     }
 

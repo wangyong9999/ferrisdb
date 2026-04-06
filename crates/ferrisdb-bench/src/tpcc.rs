@@ -786,6 +786,7 @@ impl Stats {
     fn total_aborted(&self) -> u64 {
         self.per_txn.iter().map(|s| s.aborted.load(AtomicOrdering::Relaxed)).sum()
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1117,7 @@ fn execute_new_order<R: Rng>(
     }
 
     txn.commit()?;
+
     Ok(true)
 }
 

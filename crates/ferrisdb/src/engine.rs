@@ -5,13 +5,34 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
 use ferrisdb_core::{Result, FerrisDBError};
+use parking_lot::RwLock;
 use ferrisdb_storage::buffer::{BufferPool, BufferPoolConfig, BackgroundWriter};
 use ferrisdb_storage::control::ControlFile;
 use ferrisdb_storage::catalog::SystemCatalog;
 use ferrisdb_storage::smgr::StorageManager;
-use ferrisdb_storage::wal::{WalWriter, WalFlusher, WalRecovery, RecoveryMode};
+use ferrisdb_storage::wal::{WalWriter, WalFlusher, WalRecovery, RecoveryMode, CheckpointManager, CheckpointConfig, CheckpointType};
+
+/// 引擎运行状态（供运维监控）
+#[derive(Debug, Clone)]
+pub struct EngineStats {
+    /// Buffer pool 命中率 (0.0 ~ 1.0)
+    pub buffer_pool_hit_rate: f64,
+    /// Buffer pool 总 pin 次数
+    pub buffer_pool_pins: u64,
+    /// 当前脏页数
+    pub buffer_pool_dirty_pages: u64,
+    /// 活跃事务数
+    pub active_transactions: u64,
+    /// WAL 当前写入偏移
+    pub wal_offset: u64,
+    /// 最近 checkpoint LSN
+    pub checkpoint_lsn: u64,
+    /// 是否正在关闭
+    pub is_shutdown: bool,
+}
 
 /// 引擎配置
 pub struct EngineConfig {
@@ -75,8 +96,20 @@ pub struct Engine {
     _bgwriter: Option<BackgroundWriter>,
     /// WAL flusher
     _wal_flusher: Option<WalFlusher>,
+    /// Checkpoint manager
+    checkpoint_manager: Option<Arc<CheckpointManager>>,
+    /// Checkpoint 后台线程
+    _checkpoint_handle: Option<JoinHandle<()>>,
+    /// AutoVacuum 后台线程
+    _autovacuum_handle: Option<JoinHandle<()>>,
+    /// AutoVacuum 停止信号
+    autovacuum_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// 注册的 HeapTable 列表（供 AutoVacuum 扫描）
+    registered_tables: Arc<RwLock<Vec<Arc<ferrisdb_transaction::HeapTable>>>>,
     /// 数据目录
     data_dir: PathBuf,
+    /// 是否已关闭（阻止新事务）
+    is_shutdown: std::sync::atomic::AtomicBool,
 }
 
 impl Engine {
@@ -132,32 +165,127 @@ impl Engine {
             let wal_dir = config.data_dir.join("wal");
             if wal_dir.exists() {
                 let recovery = WalRecovery::with_smgr(&wal_dir, Arc::clone(&smgr));
-                let _ = recovery.recover(RecoveryMode::CrashRecovery);
+                recovery.recover(RecoveryMode::CrashRecovery)?;
             }
         }
 
-        // 9. 标记为运行中
+        // 9. 启动 Checkpoint 后台线程
+        let (checkpoint_manager, checkpoint_handle) = if let Some(ref w) = wal_writer {
+            let mut cm = CheckpointManager::new(
+                CheckpointConfig {
+                    interval_ms: 60_000,            // 每 60 秒检查
+                    wal_size_threshold: 32 * 1024 * 1024, // 32MB WAL 增长触发
+                    dirty_page_ratio_threshold: 0.5,
+                    auto_checkpoint: true,
+                },
+                Arc::clone(w),
+            );
+            cm.set_flusher(Arc::clone(&bp) as Arc<dyn ferrisdb_storage::wal::DirtyPageFlusher>);
+            cm.set_control_file(Arc::clone(&control_file));
+            let cm = Arc::new(cm);
+            let handle = Arc::clone(&cm).start_auto_checkpoint();
+            (Some(cm), Some(handle))
+        } else {
+            (None, None)
+        };
+
+        // 10. AutoVacuum 后台线程
+        let autovacuum_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registered_tables: Arc<RwLock<Vec<Arc<ferrisdb_transaction::HeapTable>>>> =
+            Arc::new(RwLock::new(Vec::new()));
+        let autovacuum_handle = {
+            let shutdown = Arc::clone(&autovacuum_shutdown);
+            let tables = Arc::clone(&registered_tables);
+            let txn_mgr_bg = Arc::clone(&tm);
+            thread::Builder::new().name("autovacuum".into()).spawn(move || {
+                loop {
+                    if shutdown.load(std::sync::atomic::Ordering::Acquire) { break; }
+                    thread::sleep(std::time::Duration::from_secs(10));
+                    if shutdown.load(std::sync::atomic::Ordering::Acquire) { break; }
+                    // 1. 超时事务强制 abort
+                    let aborted = txn_mgr_bg.abort_timed_out_transactions();
+                    if aborted > 0 {
+                        eprintln!("[autovacuum] force-aborted {} timed-out transactions", aborted);
+                    }
+                    // 2. Vacuum dead tuples
+                    let tables = tables.read().clone();
+                    for table in &tables {
+                        let _ = table.vacuum();
+                    }
+                }
+            }).ok()
+        };
+
+        // 11. 标记为运行中
         control_file.set_state(1)?; // 1 = in production
 
         Ok(Self {
             smgr, buffer_pool: bp, wal_writer, txn_manager: tm,
             catalog, control_file,
             _bgwriter: bgwriter, _wal_flusher: wal_flusher,
+            checkpoint_manager, _checkpoint_handle: checkpoint_handle,
+            _autovacuum_handle: autovacuum_handle,
+            autovacuum_shutdown,
+            registered_tables,
             data_dir: config.data_dir,
+            is_shutdown: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// 干净关闭引擎
     pub fn shutdown(&self) -> Result<()> {
-        // Flush all dirty pages
-        self.buffer_pool.flush_all()?;
-        // Sync WAL
+        // 1. 标记为关闭中 — 阻止新事务
+        self.is_shutdown.store(true, std::sync::atomic::Ordering::Release);
+        self.txn_manager.initiate_shutdown();
+        // 2. 等待在途事务完成（最多 5 秒）
+        let remaining = self.txn_manager.wait_for_all_transactions(5000);
+        if remaining > 0 {
+            eprintln!("Warning: {} active transactions still running at shutdown", remaining);
+        }
+        // 3. 停止后台线程
+        self.autovacuum_shutdown.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(ref cm) = self.checkpoint_manager {
+            cm.stop();
+        }
+        // 3. 执行关闭 checkpoint（flush all dirty + write checkpoint record）
+        if let Some(ref cm) = self.checkpoint_manager {
+            let _ = cm.checkpoint(CheckpointType::Shutdown);
+        } else {
+            // 无 checkpoint manager，直接 flush
+            self.buffer_pool.flush_all()?;
+        }
+        // 4. Sync WAL
         if let Some(ref w) = self.wal_writer {
             w.sync()?;
         }
-        // Update control file
+        // 5. fsync 所有数据文件（确保脏页持久化到磁盘）
+        self.smgr.sync_all()?;
+        // 6. Update control file
         self.control_file.set_state(0)?; // 0 = clean shutdown
         Ok(())
+    }
+
+    /// 注册 HeapTable 供 AutoVacuum 管理
+    pub fn register_table(&self, table: Arc<ferrisdb_transaction::HeapTable>) {
+        self.registered_tables.write().push(table);
+    }
+
+    /// 检查引擎是否已关闭
+    pub fn is_shutdown(&self) -> bool {
+        self.is_shutdown.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 获取引擎运行状态（供运维监控）
+    pub fn stats(&self) -> EngineStats {
+        EngineStats {
+            buffer_pool_hit_rate: self.buffer_pool.hit_rate(),
+            buffer_pool_pins: self.buffer_pool.stat_pins(),
+            buffer_pool_dirty_pages: self.buffer_pool.dirty_page_count() as u64,
+            active_transactions: self.txn_manager.active_transaction_count() as u64,
+            wal_offset: self.wal_writer.as_ref().map_or(0, |w| w.offset()),
+            checkpoint_lsn: self.control_file.checkpoint_lsn().raw(),
+            is_shutdown: self.is_shutdown(),
+        }
     }
 
     // ==================== 表管理 ====================
@@ -259,6 +387,9 @@ impl Engine {
 
     /// 开始事务
     pub fn begin(&self) -> Result<ferrisdb_transaction::Transaction> {
+        if self.is_shutdown() {
+            return Err(FerrisDBError::InvalidState("Engine is shutting down".to_string()));
+        }
         self.txn_manager.begin()
     }
 

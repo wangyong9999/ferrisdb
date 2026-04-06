@@ -11,6 +11,7 @@ description = "FerrisDB - High-performance transactional storage engine"
 ferrisdb-core = { path = "../ferrisdb-core" }
 ferrisdb-storage = { path = "../ferrisdb-storage" }
 ferrisdb-transaction = { path = "../ferrisdb-transaction" }
+parking_lot.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -15,7 +15,9 @@ pub const DEFAULT_WAL_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 ///
 /// 缓存 WAL 记录，提供批量写入优化。
 pub struct WalBuffer {
-    /// 缓冲区数据（使用 UnsafeCell 支持内部可变性）
+    /// 缓冲区数据（固定大小，通过 atomic write_pos 分区实现无锁并发写入）
+    /// SAFETY: 每个 writer 通过 fetch_add 预留独占区间后写入，不与其他 writer 重叠。
+    /// flush 只读取 flush_pos..write_pos 区间，由 Release/Acquire 保证可见性。
     data: std::cell::UnsafeCell<Vec<u8>>,
     /// 缓冲区大小
     size: usize,

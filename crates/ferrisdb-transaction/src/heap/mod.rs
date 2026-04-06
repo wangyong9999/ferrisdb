@@ -336,6 +336,9 @@ impl HeapTable {
 
         // Allocate a new page
         let new_page_no = self.current_page.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if new_page_no >= u32::MAX - 1 {
+            return Err(FerrisDBError::Internal("Table page limit exceeded (u32::MAX)".to_string()));
+        }
         let tag = self.make_tag(new_page_no);
 
         let pinned = self.buffer_pool.pin(&tag)?;
@@ -552,6 +555,9 @@ impl HeapTable {
 
         // New page insert
         let new_page_no = self.current_page.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if new_page_no >= u32::MAX - 1 {
+            return Err(FerrisDBError::Internal("Table page limit exceeded (u32::MAX)".to_string()));
+        }
         let new_tag = self.make_tag(new_page_no);
 
         let new_pinned = self.buffer_pool.pin(&new_tag)?;

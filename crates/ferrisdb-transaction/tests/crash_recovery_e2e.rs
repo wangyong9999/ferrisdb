@@ -23,12 +23,11 @@ fn setup(dir: &std::path::Path) -> (Arc<StorageManager>, Arc<BufferPool>, Arc<Wa
     bp.set_wal_writer(Arc::clone(&wal_writer));
     let bp = Arc::new(bp);
 
-    let mut tm = TransactionManager::new(16);
-    tm.set_buffer_pool(Arc::clone(&bp));
-    tm.set_wal_writer(Arc::clone(&wal_writer));
-    // Disable timeout for test
-    tm.set_txn_timeout(0);
-    let tm = Arc::new(tm);
+    let mut tm_inner = TransactionManager::new(16);
+    tm_inner.set_buffer_pool(Arc::clone(&bp));
+    tm_inner.set_wal_writer(Arc::clone(&wal_writer));
+    tm_inner.set_txn_timeout(0);
+    let tm = Arc::new(tm_inner);
 
     (smgr, bp, wal_writer, tm)
 }

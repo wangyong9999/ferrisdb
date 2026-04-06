@@ -269,7 +269,14 @@ impl BufferPool {
                     Ok(()) => {
                         let page_slice = unsafe { std::slice::from_raw_parts(page_data, PAGE_SIZE) };
                         if !crate::page::PageHeader::verify_checksum(page_slice) {
-                            // Checksum mismatch — 旧数据可能无 checksum，继续
+                            // 非零页面 checksum 不匹配 = 磁盘数据损坏
+                            let is_zero = page_slice.iter().all(|&b| b == 0);
+                            if !is_zero {
+                                eprintln!("[buffer] page checksum mismatch for {:?}, possible disk corruption", tag);
+                                return Err(FerrisDBError::Internal(
+                                    format!("Page checksum verification failed for {:?}", tag)
+                                ));
+                            }
                         }
                         unsafe { desc.set_tag(*tag); }
                     }

@@ -197,8 +197,8 @@ impl TransactionInfo {
 pub struct Transaction {
     /// 事务信息
     info: Arc<TransactionInfo>,
-    /// 事务管理器引用（安全的 Arc 引用，避免裸指针 use-after-free）
-    manager: Arc<TransactionManagerRef>,
+    /// 事务管理器引用（Arc 保证生命周期安全）
+    manager: Arc<TransactionManager>,
     /// 是否活跃
     active: bool,
     /// 撤销日志
@@ -211,31 +211,12 @@ pub struct Transaction {
     timeout_ms: u64,
 }
 
-/// TransactionManager 的内部引用包装，用于安全地从 Transaction 访问
-pub(crate) struct TransactionManagerRef {
-    ptr: *const TransactionManager,
-}
-
-unsafe impl Send for TransactionManagerRef {}
-unsafe impl Sync for TransactionManagerRef {}
-
-impl TransactionManagerRef {
-    fn new(mgr: &TransactionManager) -> Self {
-        Self { ptr: mgr as *const TransactionManager }
-    }
-
-    /// 安全访问 — 调用者必须确保 TransactionManager 存活
-    fn get(&self) -> &TransactionManager {
-        unsafe { &*self.ptr }
-    }
-}
-
 impl Transaction {
     /// 创建新事务
-    pub(crate) fn new(info: Arc<TransactionInfo>, manager: &TransactionManager) -> Self {
+    pub(crate) fn new(info: Arc<TransactionInfo>, manager: Arc<TransactionManager>) -> Self {
         Self {
             info,
-            manager: Arc::new(TransactionManagerRef::new(manager)),
+            manager,
             active: true,
             undo_log: Vec::new(),
             buffer_pool: None,
@@ -247,17 +228,19 @@ impl Transaction {
     /// 创建带 Buffer Pool 的事务
     pub(crate) fn with_buffer_pool(
         info: Arc<TransactionInfo>,
-        manager: &TransactionManager,
+        manager: Arc<TransactionManager>,
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
+        let wal_writer = manager.wal_writer.clone();
+        let timeout_ms = manager.txn_timeout_ms;
         Self {
             info,
-            manager: Arc::new(TransactionManagerRef::new(manager)),
+            manager,
             active: true,
             undo_log: Vec::new(),
             buffer_pool: Some(buffer_pool),
-            wal_writer: manager.wal_writer.clone(),
-            timeout_ms: manager.txn_timeout_ms,
+            wal_writer,
+            timeout_ms,
         }
     }
 
@@ -318,7 +301,7 @@ impl Transaction {
         self.check_timeout()?;
 
         // 分配 CSN
-        let manager = self.manager.get();
+        let manager = &self.manager;
         let csn = manager.allocate_csn();
 
         // 正确的 commit 顺序（WAL-first）：
@@ -345,7 +328,7 @@ impl Transaction {
 
         // 标记槽位为可重用
         let xid = self.info.xid;
-        self.manager.get().release_slot(xid);
+        self.manager.release_slot(xid);
 
         Ok(())
     }
@@ -375,7 +358,7 @@ impl Transaction {
 
         // 释放槽位
         let xid = self.info.xid;
-        self.manager.get().release_slot(xid);
+        self.manager.release_slot(xid);
 
         Ok(())
     }
@@ -573,7 +556,7 @@ impl Transaction {
     /// 获取事务的 CSN
     fn get_transaction_csn(&self, xid: Xid) -> Csn {
         // 简化实现：从管理器获取
-        let manager = self.manager.get();
+        let manager = &self.manager;
         manager.get_csn(xid)
     }
 }
@@ -648,7 +631,8 @@ impl TransactionManager {
     }
 
     /// 开始新事务（关闭中时拒绝）
-    pub fn begin(&self) -> ferrisdb_core::Result<Transaction> {
+    /// 接受 &Arc<Self> 以便 Transaction 安全持有 Arc 引用（无裸指针）
+    pub fn begin(self: &Arc<Self>) -> ferrisdb_core::Result<Transaction> {
         if self.is_shutdown.load(std::sync::atomic::Ordering::Acquire) {
             return Err(FerrisDBError::InvalidState("Engine is shutting down".to_string()));
         }
@@ -683,9 +667,9 @@ impl TransactionManager {
         };
 
         if let Some(ref bp) = self.buffer_pool {
-            Ok(Transaction::with_buffer_pool(info, self, Arc::clone(bp)))
+            Ok(Transaction::with_buffer_pool(info, Arc::clone(self), Arc::clone(bp)))
         } else {
-            Ok(Transaction::new(info, self))
+            Ok(Transaction::new(info, Arc::clone(self)))
         }
     }
 
@@ -813,7 +797,7 @@ mod tests {
 
     #[test]
     fn test_transaction_manager_begin() {
-        let mgr = TransactionManager::new(100);
+        let mgr = Arc::new(TransactionManager::new(100));
         let tx = mgr.begin().unwrap();
         assert!(tx.is_active());
         assert_eq!(tx.state(), TransactionState::InProgress);
@@ -821,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_transaction_commit() {
-        let mgr = TransactionManager::new(100);
+        let mgr = Arc::new(TransactionManager::new(100));
         let mut tx = mgr.begin().unwrap();
         tx.commit().unwrap();
         assert!(!tx.is_active());
@@ -831,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_transaction_abort() {
-        let mgr = TransactionManager::new(100);
+        let mgr = Arc::new(TransactionManager::new(100));
         let mut tx = mgr.begin().unwrap();
         tx.abort().unwrap();
         assert!(!tx.is_active());
@@ -840,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_transaction_visibility_own_tuple() {
-        let mgr = TransactionManager::new(100);
+        let mgr = Arc::new(TransactionManager::new(100));
         let tx = mgr.begin().unwrap();
 
         // 自己插入的元组，未删除

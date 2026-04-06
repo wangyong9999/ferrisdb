@@ -809,7 +809,7 @@ impl Stats {
 ///    d. INSERT ORDER_LINE
 fn execute_new_order<R: Rng>(
     tables: &TpccTables,
-    txn_mgr: &TransactionManager,
+    txn_mgr: &Arc<TransactionManager>,
     rng: &mut R,
     num_warehouses: u32,
     item_num: u32,
@@ -1133,7 +1133,7 @@ fn execute_new_order<R: Rng>(
 /// 7. INSERT history
 fn execute_payment<R: Rng>(
     tables: &TpccTables,
-    txn_mgr: &TransactionManager,
+    txn_mgr: &Arc<TransactionManager>,
     rng: &mut R,
     num_warehouses: u32,
 ) -> ferrisdb_core::Result<bool> {
@@ -1347,7 +1347,7 @@ fn execute_payment<R: Rng>(
 /// 3. SELECT order_line by o_id
 fn execute_order_status<R: Rng>(
     tables: &TpccTables,
-    txn_mgr: &TransactionManager,
+    txn_mgr: &Arc<TransactionManager>,
     rng: &mut R,
     num_warehouses: u32,
 ) -> ferrisdb_core::Result<bool> {
@@ -1418,7 +1418,7 @@ fn execute_order_status<R: Rng>(
 /// 5. UPDATE customer SET c_delivery_cnt += 1, c_balance += ol_amount_sum
 fn execute_delivery<R: Rng>(
     tables: &TpccTables,
-    txn_mgr: &TransactionManager,
+    txn_mgr: &Arc<TransactionManager>,
     rng: &mut R,
     num_warehouses: u32,
 ) -> ferrisdb_core::Result<bool> {
@@ -1604,7 +1604,7 @@ fn execute_delivery<R: Rng>(
 /// 3. Count distinct items with s_quantity < threshold
 fn execute_stock_level<R: Rng>(
     tables: &TpccTables,
-    txn_mgr: &TransactionManager,
+    txn_mgr: &Arc<TransactionManager>,
     rng: &mut R,
     num_warehouses: u32,
 ) -> ferrisdb_core::Result<bool> {

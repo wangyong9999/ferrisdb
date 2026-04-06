@@ -2,6 +2,7 @@
 //!
 //! Covers: H3 (Undo WAL types), H14 (Transaction Drop safety)
 
+use std::sync::Arc;
 use ferrisdb_core::Xid;
 use ferrisdb_transaction::TransactionManager;
 
@@ -37,7 +38,7 @@ fn test_undo_wal_types_differentiated() {
 
 #[test]
 fn test_commit_then_drop_no_double_abort() {
-    let mgr = TransactionManager::new(16);
+    let mgr = Arc::new(TransactionManager::new(16));
     let mut txn = mgr.begin().unwrap();
     assert!(txn.is_active());
     txn.commit().unwrap();
@@ -47,7 +48,7 @@ fn test_commit_then_drop_no_double_abort() {
 
 #[test]
 fn test_drop_uncommitted_txn_releases_slot() {
-    let mgr = TransactionManager::new(4);
+    let mgr = Arc::new(TransactionManager::new(4));
     // Fill 3 slots (slots 1, 2, 3; slot 0 is reserved)
     {
         let _t1 = mgr.begin().unwrap();
@@ -63,7 +64,7 @@ fn test_drop_uncommitted_txn_releases_slot() {
 
 #[test]
 fn test_abort_then_drop_no_panic() {
-    let mgr = TransactionManager::new(16);
+    let mgr = Arc::new(TransactionManager::new(16));
     let mut txn = mgr.begin().unwrap();
     txn.abort().unwrap();
     assert!(!txn.is_active());

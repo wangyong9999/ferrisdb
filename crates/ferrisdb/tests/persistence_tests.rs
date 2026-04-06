@@ -25,6 +25,7 @@ fn test_fsm_save_load_roundtrip() {
     }
     eng.save_table_state("t", &table).unwrap();
     eng.shutdown().unwrap();
+    drop(eng);
 
     // Reopen — FSM should be loaded
     let eng2 = engine(&td);
@@ -43,6 +44,7 @@ fn test_fsm_empty_table_no_file() {
     // No inserts → FSM file shouldn't cause issues
     eng.save_table_state("empty", &table).unwrap();
     eng.shutdown().unwrap();
+    drop(eng);
 
     let eng2 = engine(&td);
     let table2 = eng2.open_table("empty").unwrap();
@@ -62,6 +64,7 @@ fn test_fsm_survives_restart() {
         }
         eng.save_table_state("fsm_t", &table).unwrap();
         eng.shutdown().unwrap();
+    drop(eng);
     }
     {
         let eng = engine(&td);
@@ -95,6 +98,7 @@ fn test_fsm_multiple_tables() {
         eng.save_table_state(&name, &t).unwrap();
     }
     eng.shutdown().unwrap();
+    drop(eng);
 
     let eng2 = engine(&td);
     for i in 0..3 {
@@ -111,6 +115,7 @@ fn test_control_file_persists_state() {
     {
         let eng = engine(&td);
         eng.shutdown().unwrap(); // state = 0 (clean)
+    drop(eng);
     }
     let cf = ferrisdb_storage::ControlFile::open(td.path()).unwrap();
     assert_eq!(cf.get_data().state, 0);
@@ -133,6 +138,7 @@ fn test_control_file_corruption_detected() {
     {
         let eng = engine(&td);
         eng.shutdown().unwrap();
+    drop(eng);
     }
     // Corrupt the control file
     let path = td.path().join("dstore_control");
@@ -152,6 +158,7 @@ fn test_control_file_multiple_shutdowns() {
     for _ in 0..3 {
         let eng = engine(&td);
         eng.shutdown().unwrap();
+    drop(eng);
     }
     let cf = ferrisdb_storage::ControlFile::open(td.path()).unwrap();
     assert_eq!(cf.get_data().state, 0);
@@ -164,6 +171,7 @@ fn test_control_file_with_wal() {
         let eng = engine_wal(&td);
         eng.create_table("wal_t").unwrap();
         eng.shutdown().unwrap();
+    drop(eng);
     }
     let cf = ferrisdb_storage::ControlFile::open(td.path()).unwrap();
     assert_eq!(cf.get_data().state, 0);
@@ -181,6 +189,7 @@ fn test_engine_flush_on_shutdown() {
         t.insert(b"must_persist", Xid::new(0, 1), 0).unwrap();
         eng.save_table_state("flush_t", &t).unwrap();
         eng.shutdown().unwrap();
+    drop(eng);
     }
     {
         let eng = engine(&td);
@@ -198,6 +207,7 @@ fn test_engine_catalog_survives_restart() {
         eng.create_table("b").unwrap();
         eng.create_index("a_idx", "a").unwrap();
         eng.shutdown().unwrap();
+    drop(eng);
     }
     {
         let eng = engine(&td);
@@ -218,6 +228,7 @@ fn test_engine_table_data_survives() {
         tid = t.insert(b"durable_data", Xid::new(0, 1), 0).unwrap();
         eng.save_table_state("persist", &t).unwrap();
         eng.shutdown().unwrap();
+    drop(eng);
     }
     {
         let eng = engine_wal(&td);
@@ -245,6 +256,7 @@ fn test_engine_index_root_survives() {
         }
         eng.save_index_state("idx_t_pk", &idx).unwrap();
         eng.shutdown().unwrap();
+    drop(eng);
     }
     {
         let eng = engine(&td);
@@ -266,6 +278,7 @@ fn test_engine_multiple_restarts() {
         t.insert(format!("data_{}", round).as_bytes(), Xid::new(0, (round+1) as u32), 0).unwrap();
         eng.save_table_state(&name, &t).unwrap();
         eng.shutdown().unwrap();
+    drop(eng);
     }
     let eng = engine(&td);
     for round in 0..3 {
@@ -419,6 +432,7 @@ fn test_engine_checkpoint_crash_recovery_e2e() {
 
         // Force a checkpoint (shutdown does this)
         eng.shutdown().unwrap();
+    drop(eng);
     }
 
     // Phase 2: Reopen — data should survive via checkpoint + WAL recovery
@@ -434,6 +448,7 @@ fn test_engine_checkpoint_crash_recovery_e2e() {
         // Table should have data (page count > 0)
         assert!(table.get_current_page() > 0, "Table data should survive crash recovery");
         eng.shutdown().unwrap();
+    drop(eng);
     }
 }
 
@@ -491,4 +506,37 @@ fn test_engine_txn_timeout_forced_abort() {
 
     drop(txn); // Drop should auto-abort
     eng.shutdown().unwrap();
+}
+
+/// Engine lockfile prevents concurrent opens on same data directory
+#[test]
+fn test_engine_lockfile_prevents_concurrent_open() {
+    let td = TempDir::new().unwrap();
+
+    let eng1 = Engine::open(EngineConfig {
+        data_dir: td.path().to_path_buf(),
+        shared_buffers: 100,
+        wal_enabled: false,
+        ..Default::default()
+    });
+    assert!(eng1.is_ok(), "First open should succeed");
+
+    // Second open on same directory should fail
+    let eng2 = Engine::open(EngineConfig {
+        data_dir: td.path().to_path_buf(),
+        shared_buffers: 100,
+        wal_enabled: false,
+        ..Default::default()
+    });
+    assert!(eng2.is_err(), "Second open should fail — lockfile held");
+
+    // After dropping first, second should succeed
+    drop(eng1);
+    let eng3 = Engine::open(EngineConfig {
+        data_dir: td.path().to_path_buf(),
+        shared_buffers: 100,
+        wal_enabled: false,
+        ..Default::default()
+    });
+    assert!(eng3.is_ok(), "After drop, open should succeed");
 }

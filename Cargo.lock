@@ -369,6 +369,7 @@ dependencies = [
  "ferrisdb-core",
  "ferrisdb-storage",
  "ferrisdb-transaction",
+ "libc",
  "parking_lot",
  "tempfile",
 ]

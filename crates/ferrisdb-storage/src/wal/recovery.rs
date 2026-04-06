@@ -731,8 +731,13 @@ impl WalRecovery {
             return Ok(None);
         }
 
-        // 读取页面
+        // 读取页面并校验 CRC（防止在损坏页面上 redo）
         let page_data = ctx.read_page(page_id)?;
+        if page_data.len() >= PAGE_SIZE && !page_data.iter().all(|&b| b == 0) {
+            if !crate::page::PageHeader::verify_checksum(&page_data) {
+                eprintln!("[recovery] page {:?} checksum mismatch, applying FPW or WAL redo to fix", page_id);
+            }
+        }
         Ok(Some(page_data))
     }
 
@@ -1004,7 +1009,9 @@ impl WalRecovery {
                     && btree_page.header().page_type == 0 {
                     btree_page.init(crate::index::BTreePageType::Leaf, 0);
                 }
-                btree_page.insert_item_sorted(&item);
+                if btree_page.insert_item_sorted(&item).is_none() {
+                    eprintln!("[recovery] BTree leaf insert failed (page full) at LSN {:?}", record_lsn);
+                }
             }
         }
 

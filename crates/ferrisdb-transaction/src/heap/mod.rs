@@ -320,7 +320,7 @@ impl HeapTable {
                                 table_oid: self.table_oid,
                                 page_no: last_page,
                                 tuple_offset: offset,
-                            });
+                            })?;
                         }
 
                         // 更新 FSM
@@ -365,7 +365,7 @@ impl HeapTable {
                 table_oid: self.table_oid,
                 page_no: new_page_no,
                 tuple_offset: offset,
-            });
+            })?;
         }
 
         drop(_lock);
@@ -432,7 +432,8 @@ impl HeapTable {
                 old_header.xmax = xmax;
                 old_header.cmax = cmax;
 
-                let old_data_mut = page.get_tuple_mut(tid.ip_posid).unwrap();
+                let old_data_mut = page.get_tuple_mut(tid.ip_posid)
+                    .ok_or_else(|| FerrisDBError::Internal("Tuple not found during update (concurrent vacuum?)".to_string()))?;
                 old_data_mut[0..32].copy_from_slice(&old_header.serialize());
                 old_data_mut[32..].copy_from_slice(new_data);
 
@@ -453,7 +454,7 @@ impl HeapTable {
                 // Push undo actions to transaction
                 if let Some(ref mut txn) = txn {
                     for action in undo_actions {
-                        txn.push_undo(action);
+                        txn.push_undo(action)?;
                     }
                 }
 
@@ -478,7 +479,8 @@ impl HeapTable {
             old_header.cmax = cmax;
             let updated_old_header = old_header.serialize();
 
-            let old_data_mut = page.get_tuple_mut(tid.ip_posid).unwrap();
+            let old_data_mut = page.get_tuple_mut(tid.ip_posid)
+                .ok_or_else(|| FerrisDBError::Internal("Tuple vanished during cross-page update".to_string()))?;
             old_data_mut[0..32].copy_from_slice(&updated_old_header);
 
             let new_header = TupleHeader::new(old_header_xmin, old_header_cmin);
@@ -496,7 +498,8 @@ impl HeapTable {
             if page.has_free_space((total_size + 5) as u16) {
                 if let Some(offset) = page.insert_tuple(&tuple_data) {
                     // Set old tuple's ctid to point to new version (forward chain)
-                    let old_data_mut2 = page.get_tuple_mut(tid.ip_posid).unwrap();
+                    let old_data_mut2 = page.get_tuple_mut(tid.ip_posid)
+                        .ok_or_else(|| FerrisDBError::Internal("Tuple vanished during ctid update".to_string()))?;
                     let new_ctid = TupleId::new(tid.ip_blkid, offset);
                     old_data_mut2[24..28].copy_from_slice(&new_ctid.ip_blkid.to_le_bytes());
                     old_data_mut2[28..30].copy_from_slice(&new_ctid.ip_posid.to_le_bytes());
@@ -517,13 +520,13 @@ impl HeapTable {
                                 table_oid: self.table_oid,
                                 page_no: tid.ip_blkid,
                                 tuple_offset: offset,
-                            });
+                            })?;
                             txn.push_undo(UndoAction::UpdateOldPage {
                                 table_oid: self.table_oid,
                                 page_no: tid.ip_blkid,
                                 tuple_offset: tid.ip_posid,
                                 old_header: old_hdr,
-                            });
+                            })?;
                         }
                     }
 
@@ -607,7 +610,7 @@ impl HeapTable {
                 tuple_offset: new_offset,
             });
             for action in undo_actions {
-                txn.push_undo(action);
+                txn.push_undo(action)?;
             }
         }
 
@@ -653,7 +656,8 @@ impl HeapTable {
         header.cmax = cmax;
         let updated_header = header.serialize();
 
-        let old_data_mut = page.get_tuple_mut(tid.ip_posid).unwrap();
+        let old_data_mut = page.get_tuple_mut(tid.ip_posid)
+            .ok_or_else(|| FerrisDBError::Internal("Tuple not found during delete".to_string()))?;
         old_data_mut[0..32].copy_from_slice(&updated_header);
 
         // WAL
@@ -672,7 +676,7 @@ impl HeapTable {
                     page_no: tid.ip_blkid,
                     tuple_offset: tid.ip_posid,
                     old_data: old_bytes,
-                });
+                })?;
             }
         }
 

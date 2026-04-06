@@ -80,6 +80,8 @@ impl EngineConfig {
 /// engine.shutdown()?;
 /// ```
 pub struct Engine {
+    /// 数据目录锁文件（持有期间独占数据目录，防止并发打开）
+    _lockfile: std::fs::File,
     /// 存储管理器
     smgr: Arc<StorageManager>,
     /// Buffer Pool
@@ -115,6 +117,25 @@ pub struct Engine {
 impl Engine {
     /// 打开或创建数据库引擎
     pub fn open(config: EngineConfig) -> Result<Self> {
+        // 0. 数据目录锁——防止多进程同时打开同一数据库
+        std::fs::create_dir_all(&config.data_dir)
+            .map_err(|e| FerrisDBError::Internal(format!("Cannot create data dir: {}", e)))?;
+        let lock_path = config.data_dir.join(".ferrisdb.lock");
+        let lockfile = std::fs::OpenOptions::new()
+            .write(true).create(true).open(&lock_path)
+            .map_err(|e| FerrisDBError::Internal(format!("Cannot open lockfile: {}", e)))?;
+        use std::os::unix::fs::FileExt;
+        // try_lock_exclusive via fcntl
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&lockfile);
+        let ret = unsafe {
+            libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB)
+        };
+        if ret != 0 {
+            return Err(FerrisDBError::Internal(
+                "Database is already in use by another process".to_string()
+            ));
+        }
+
         // 1. 初始化存储目录
         let smgr = Arc::new(StorageManager::new(&config.data_dir));
         smgr.init()?;
@@ -220,6 +241,7 @@ impl Engine {
         control_file.set_state(1)?; // 1 = in production
 
         Ok(Self {
+            _lockfile: lockfile,
             smgr, buffer_pool: bp, wal_writer, txn_manager: tm,
             catalog, control_file,
             _bgwriter: bgwriter, _wal_flusher: wal_flusher,

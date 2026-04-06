@@ -366,14 +366,21 @@ impl Transaction {
     /// 记录撤销动作
     ///
     /// 同时写入内存 undo_log 和 WAL（如果启用了 WalWriter）。
-    pub fn push_undo(&mut self, action: UndoAction) {
+    /// 错误传播：Undo WAL 写入失败或 undo_log 过大都返回错误。
+    pub fn push_undo(&mut self, action: UndoAction) -> ferrisdb_core::Result<()> {
+        // 大小限制：防止长事务 OOM（默认 1M 条 undo action）
+        const MAX_UNDO_ACTIONS: usize = 1_000_000;
+        if self.undo_log.len() >= MAX_UNDO_ACTIONS {
+            return Err(FerrisDBError::Transaction(TransactionError::InvalidState(
+                format!("Transaction too large: undo_log exceeds {} actions", MAX_UNDO_ACTIONS)
+            )));
+        }
         if let Some(ref writer) = self.wal_writer {
             let wal_data = action.serialize_for_wal(self.info.xid);
-            if let Err(_e) = writer.write(&wal_data) {
-                // Undo WAL 写入失败：不阻塞 DML，但 crash 后无法回滚此操作
-            }
+            writer.write(&wal_data)?;
         }
         self.undo_log.push(action);
+        Ok(())
     }
 
     /// 创建 Savepoint，返回 savepoint ID（即当前 undo_log 的位置）

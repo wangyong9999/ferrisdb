@@ -128,6 +128,16 @@ impl WalBuffer {
         Ok(lsn)
     }
 
+    /// 获取数据切片（公开，供 flush 使用）
+    pub fn data_slice(&self) -> &[u8] {
+        self.data()
+    }
+
+    /// 推进 flush 位置
+    pub fn advance_flush(&self, new_pos: usize) {
+        self.flush_pos.store(new_pos, Ordering::Release);
+    }
+
     /// 开始原子组写入
     ///
     /// 返回原子组的起始位置

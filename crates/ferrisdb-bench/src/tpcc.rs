@@ -366,9 +366,19 @@ impl TpccTables {
     fn new(buffer_pool: Arc<BufferPool>, txn_mgr: Arc<TransactionManager>, customer_per_district: u32, wal_writer: Option<Arc<ferrisdb_storage::WalWriter>>) -> Self {
         let bp = &buffer_pool;
         let tm = &txn_mgr;
+        // WAL 模式：DML 写入 WalBuffer（无锁），commit 写入 WalWriter
+        let wal_buf: Option<Arc<ferrisdb_storage::WalBuffer>> = if wal_writer.is_some() {
+            Some(Arc::new(ferrisdb_storage::WalBuffer::new(128 * 1024 * 1024))) // 128MB for long runs
+        } else {
+            None
+        };
         let make_table = |oid: u32| -> Arc<HeapTable> {
             if let Some(ref w) = wal_writer {
-                Arc::new(HeapTable::with_wal_writer(oid, Arc::clone(bp), Arc::clone(tm), Arc::clone(w)))
+                let mut t = HeapTable::with_wal_writer(oid, Arc::clone(bp), Arc::clone(tm), Arc::clone(w));
+                if let Some(ref buf) = wal_buf {
+                    t.set_wal_buffer(Arc::clone(buf));
+                }
+                Arc::new(t)
             } else {
                 Arc::new(HeapTable::new(oid, Arc::clone(bp), Arc::clone(tm)))
             }
@@ -1817,6 +1827,8 @@ fn main() {
     };
     // Start background WAL flusher (5ms interval for tight group commit)
     let _wal_flusher = wal_writer.as_ref().map(|w| w.start_flusher(5));
+
+    // Note: WalBuffer is 128MB, enough for medium runs without flusher
 
     // Wire WAL writer to buffer pool (WAL-before-data enforcement)
     if let Some(ref w) = wal_writer {

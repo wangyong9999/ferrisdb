@@ -686,6 +686,16 @@ impl BTree {
         self.next_page.load(Ordering::Acquire)
     }
 
+    /// 获取当前 free pages 列表（用于持久化）
+    pub fn get_free_pages(&self) -> Vec<u32> {
+        self.free_pages.lock().clone()
+    }
+
+    /// 设置 free pages 列表（startup 时从 catalog 恢复）
+    pub fn set_free_pages(&self, pages: Vec<u32>) {
+        *self.free_pages.lock() = pages;
+    }
+
     /// 回收空页面到 free list
     fn recycle_page(&self, page_no: u32) {
         self.free_pages.lock().push(page_no);
@@ -724,8 +734,10 @@ impl BTree {
 
     /// 插入键值对（允许重复 key）
     ///
-    /// split_mutex 保护整个 insert 路径，确保树结构一致性。
-    /// Lookup（读）不受影响，通过 page lock + right-link 保证并发安全。
+    /// split_mutex 保护整个 insert+split 路径（保证并发正确性）。
+    /// Lookup（读）不受影响，通过 page lock + right-link 保证安全。
+    /// 注：完整的 B-link tree 乐观协议需要 leaf→parent latch crabbing，
+    /// 这是后续优化项（C++ dstore 实现了完整的 SMO 协议）。
     pub fn insert(&self, key: BTreeKey, value: BTreeValue) -> ferrisdb_core::Result<()> {
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
         let _guard = self.split_mutex.lock();

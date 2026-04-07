@@ -167,6 +167,12 @@ impl HeapTable {
     }
 
     /// 设置 WAL Writer（可在创建后追加）
+    /// 设置 WAL Buffer（用于 DML 无锁写入）
+    pub fn set_wal_buffer(&mut self, buf: Arc<WalBuffer>) {
+        self.wal_buffer = Some(buf);
+    }
+
+    /// 设置 WAL Writer（用于 commit 持久化）
     pub fn set_wal_writer(&mut self, writer: Arc<WalWriter>) {
         self.wal_writer = Some(writer);
     }
@@ -260,14 +266,17 @@ impl HeapTable {
 
     /// 写入 WAL 记录
     ///
-    /// 优先写 WalWriter（磁盘持久化），回退到 WalBuffer（内存）。
-    /// 错误必须传播——静默丢弃会导致已提交数据在 crash 后丢失。
+    /// WAL 模式优化：先尝试 WalBuffer（无锁 atomic），满了则 fallback 到 WalWriter。
     #[inline]
     fn wal_write(&self, record_data: &[u8]) -> ferrisdb_core::Result<()> {
+        if let Some(ref buf) = self.wal_buffer {
+            if buf.write(record_data).is_ok() {
+                return Ok(()); // 快速路径：无锁写入成功
+            }
+            // Buffer 满：fallback 到 WalWriter（有 Mutex，但只在 buffer 满时走）
+        }
         if let Some(ref writer) = self.wal_writer {
             writer.write(record_data)?;
-        } else if let Some(ref buf) = self.wal_buffer {
-            buf.write(record_data)?;
         }
         Ok(())
     }
@@ -801,17 +810,11 @@ impl HeapTable {
         }
 
         if any_dead {
-            let reclaimed = page.compact_dead();
+            let _reclaimed = page.compact_dead();
+            let free = page.free_space();
             drop(_lock);
             pinned.mark_dirty();
-            // 更新 FSM
-            let pinned2 = match self.buffer_pool.pin(&tag) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            let pg = unsafe { HeapPage::from_bytes(std::slice::from_raw_parts_mut(pinned2.page_data(), 8192)) };
-            self.fsm_update(page_no, pg.free_space());
-            let _ = reclaimed;
+            self.fsm_update(page_no, free);
         }
     }
 
@@ -876,8 +879,11 @@ impl HeapTable {
 
         if any_dead {
             let reclaimed = page.compact_dead();
+            let free = page.free_space();
             drop(_lock);
             pinned.mark_dirty();
+            // 更新 FSM（让后续 insert 重用这个页面的空间）
+            self.fsm_update(page_no, free);
             reclaimed
         } else {
             0

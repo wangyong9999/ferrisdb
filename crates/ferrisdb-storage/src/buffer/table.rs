@@ -44,9 +44,17 @@ impl Default for BufTableEntry {
     }
 }
 
-/// Buffer Hash 表
+/// 分区数（必须是 2 的幂）
+const NUM_PARTITIONS: usize = 128;
+
+/// 单个分区
+struct BufTablePartition {
+    lock: RwLock<()>,
+}
+
+/// Buffer Hash 表（128 分区，每分区独立 RwLock）
 ///
-/// 使用链地址法处理冲突。
+/// 使用链地址法处理冲突。分区减少 writer 对 reader 的阻塞。
 pub struct BufTable {
     /// Hash 槽位数组
     buckets: Vec<AtomicU32>,
@@ -54,8 +62,10 @@ pub struct BufTable {
     entries: Vec<BufTableEntry>,
     /// 空闲条目链表头
     free_list: AtomicU32,
-    /// 保护 tag 读写（RwLock：lookup 取读锁，insert/remove 取写锁）
-    lock: RwLock<()>,
+    /// 空闲链表保护锁
+    free_lock: parking_lot::Mutex<()>,
+    /// 分区锁数组
+    partitions: Vec<BufTablePartition>,
     /// 掩码（用于取模）
     mask: usize,
 }
@@ -81,11 +91,16 @@ impl BufTable {
             entries.push(entry);
         }
 
+        let partitions = (0..NUM_PARTITIONS)
+            .map(|_| BufTablePartition { lock: RwLock::new(()) })
+            .collect();
+
         Self {
             buckets,
             entries,
             free_list: AtomicU32::new(0),
-            lock: RwLock::new(()),
+            free_lock: parking_lot::Mutex::new(()),
+            partitions,
             mask: size - 1,
         }
     }
@@ -96,10 +111,15 @@ impl BufTable {
         tag.hash_value() as usize & self.mask
     }
 
-    /// 查找 Buffer（读锁保护，防止 torn read）
+    #[inline]
+    fn partition_idx(&self, hash: usize) -> usize {
+        hash % NUM_PARTITIONS
+    }
+
+    /// 查找 Buffer（分区读锁保护）
     pub fn lookup(&self, tag: &BufferTag) -> Option<BufId> {
-        let _guard = self.lock.read();
         let hash = self.hash(tag);
+        let _guard = self.partitions[self.partition_idx(hash)].lock.read();
         let mut idx = self.buckets[hash].load(Ordering::Acquire);
 
         while idx != u32::MAX {
@@ -122,8 +142,8 @@ impl BufTable {
     ///
     /// 返回是否成功（失败表示已存在或表已满）
     pub fn insert(&self, tag: BufferTag, buf_id: BufId) -> bool {
-        let _guard = self.lock.write();
         let hash = self.hash(&tag);
+        let _guard = self.partitions[self.partition_idx(hash)].lock.write();
 
         // 检查是否已存在
         let mut idx = self.buckets[hash].load(Ordering::Acquire);
@@ -137,7 +157,8 @@ impl BufTable {
             idx = entry.next.load(Ordering::Acquire);
         }
 
-        // 从空闲链表获取一个条目
+        // 从空闲链表获取一个条目（free_lock 保护跨分区共享的 free_list）
+        let _fl = self.free_lock.lock();
         let free_idx = self.free_list.load(Ordering::Acquire);
         if free_idx == u32::MAX {
             return false; // 表已满
@@ -145,6 +166,7 @@ impl BufTable {
 
         let entry = &self.entries[free_idx as usize];
         self.free_list.store(entry.next.load(Ordering::Acquire), Ordering::Release);
+        drop(_fl);
 
         // 设置条目
         // SAFETY: We hold the lock, so this is safe
@@ -162,8 +184,8 @@ impl BufTable {
 
     /// 删除 Buffer
     pub fn remove(&self, tag: &BufferTag) -> Option<BufId> {
-        let _guard = self.lock.write();
         let hash = self.hash(tag);
+        let _guard = self.partitions[self.partition_idx(hash)].lock.write();
 
         let mut prev_idx = u32::MAX;
         let mut idx = self.buckets[hash].load(Ordering::Acquire);
@@ -185,8 +207,11 @@ impl BufTable {
                 }
 
                 // 添加到空闲链表
-                entry.next.store(self.free_list.load(Ordering::Acquire), Ordering::Release);
-                self.free_list.store(idx, Ordering::Release);
+                {
+                    let _fl = self.free_lock.lock();
+                    entry.next.store(self.free_list.load(Ordering::Acquire), Ordering::Release);
+                    self.free_list.store(idx, Ordering::Release);
+                }
 
                 // 清理条目
                 entry.buf_id.store(-1, Ordering::Release);

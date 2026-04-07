@@ -1,122 +1,153 @@
-# FerrisDB Single-Node MVP Phase 2 — Production Hardening
+# FerrisDB Single-Node MVP Phase 3 — Enterprise Readiness
 
-> Created: 2026-04-06
-> Baseline: commit fe1ab93 (1,024 tests, 0 failures, ASan clean)
-> Previous phase: [docs/MVP_PHASE1_COMPLETED.md](MVP_PHASE1_COMPLETED.md)
-
----
-
-## 1. Deep Analysis Findings
-
-### 1.1 Code Health Metrics
-
-| Metric | Count | Risk |
-|--------|-------|------|
-| Source lines | 22,768 | — |
-| Test lines | 6,447 | — |
-| unsafe blocks | 119 | Audited (Phase 1) |
-| unsafe impl Send/Sync | 24 | Reduced from 26 |
-| `let _ =` (suppressed errors) | 23 | **10+ on critical paths** |
-| `.unwrap()` in non-test code | 112 | **~8 on hot DML paths** |
-| `panic!/unreachable!` | 0 | Clean |
-
-### 1.2 Critical Issues Found
-
-#### C1. HeapTable DML unwrap() — UPDATE/DELETE can panic
-
-**Files:** `heap/mod.rs:435, 481, 499, 656`
-
-`get_tuple_mut(tid).unwrap()` on update/delete hot path. If tuple is concurrently vacuumed or page compacted between the existence check and the mut access, this panics. Should return `Result` error.
-
-**Severity:** CRITICAL — production crash on concurrent write+vacuum
-
-#### C2. Undo WAL write failure silently ignored
-
-**File:** `transaction/mod.rs:372`
-
-`push_undo()` calls `writer.write()` but ignores the error with `if let Err(_e)`. If undo WAL fails (disk full), the undo action is only in memory. Crash after insert but before commit → undo records lost → cannot rollback → inconsistent state.
-
-**Severity:** CRITICAL — silent data inconsistency after crash
-
-#### C3. BTree recovery insert ignores page-full failure
-
-**File:** `recovery.rs` redo_btree_insert_leaf
-
-`btree_page.insert_item_sorted(&item)` return value ignored. If page is full during recovery redo, the insert is silently dropped → index missing entries after recovery.
-
-**Severity:** HIGH — index corruption after crash recovery
-
-#### C4. Undo log unbounded memory growth
-
-**File:** `transaction/mod.rs:205, 376`
-
-`undo_log: Vec<UndoAction>` grows without limit. Long transaction with millions of updates accumulates all old data in memory. 1M updates × 10KB old_data = 10GB.
-
-**Severity:** CRITICAL — OOM kill on long transactions
-
-#### C5. No Engine lockfile — concurrent opens corrupt database
-
-**File:** `engine.rs:117`
-
-`Engine::open()` has no exclusive lock on the data directory. Two processes opening the same directory simultaneously run recovery concurrently → corrupt pages.
-
-**Severity:** HIGH — data corruption on mis-deployment
-
-#### C6. HeapScan snapshot not integrated with transaction
-
-**File:** `heap/mod.rs:987`
-
-HeapScan freezes `max_page` at creation time but doesn't use transaction snapshot. Pages added after scan starts are invisible (correct for snapshot), but concurrent vacuum can compact pages being scanned.
-
-**Severity:** HIGH — incorrect query results under concurrent write
-
-#### C7. Recovery doesn't validate page checksum before redo
-
-**File:** `recovery.rs:735`
-
-`prepare_redo()` reads page from disk but doesn't verify CRC before applying WAL records. If page was partially written (torn page) and FPW is not available, recovery applies WAL on corrupted page → propagates corruption.
-
-**Severity:** MEDIUM — silent corruption propagation (mitigated by FPW)
+> Created: 2026-04-07
+> Baseline: commit f94b9bd (1,027 tests, 0 failures, ASan clean)
+> Previous phases: [Phase 1](MVP_PHASE1_COMPLETED.md) | [Phase 2](MVP_PHASE2_COMPLETED.md)
 
 ---
 
-## 2. Fix Plan (Priority Order)
+## 1. Benchmark Data
 
-### Phase 2A: P0 — Crash Safety (must fix before any production use)
+### 1.1 Warehouse Scalability (16 threads, 15s)
 
-| # | Item | Description | Est. |
-|---|------|-------------|------|
-| P0-1 | HeapTable unwrap → Result | Replace 4 `.unwrap()` with `.ok_or()` in update/delete paths | 0.5h |
-| P0-2 | Undo WAL error propagation | `push_undo()` returns `Result<()>`, callers propagate. If undo WAL fails, abort the transaction. | 1h |
-| P0-3 | Undo log size limit | Add configurable max (default 1M actions). Exceed → error, forces commit or abort. | 0.5h |
-| P0-4 | Engine lockfile | `flock()` on `data_dir/.ferrisdb.lock` during `Engine::open()`. | 0.5h |
+| Warehouses | TPS | Notes |
+|-----------|-----|-------|
+| 1 | 3,601 | High contention on single warehouse |
+| 5 | **5,332** | Peak throughput |
+| 10 | 4,731 | Slight decline |
+| 20 | 3,480 | Working set exceeds L3 cache |
+| 50 | 1,495 | Significant degradation |
 
-### Phase 2B: P1 — Recovery Correctness
+**Issue**: 50W drops to 1,495 TPS (72% loss from peak). Root cause: buffer pool 300K pages covers ~2.4GB, 50W data set exceeds this.
 
-| # | Item | Description | Est. |
-|---|------|-------------|------|
-| P1-1 | BTree recovery insert validation | Check `insert_item_sorted` return, log warning if page full | 0.5h |
-| P1-2 | Recovery page checksum validation | `prepare_redo()` verifies CRC before applying WAL | 0.5h |
+### 1.2 Thread Scalability (20W, 15s)
 
-### Phase 2C: P2 — Operational Robustness
+| Threads | TPS | Speedup vs 1T |
+|---------|-----|---------------|
+| 1 | 1,079 | 1.0x |
+| 2 | 1,715 | 1.6x |
+| 4 | 2,479 | 2.3x |
+| 8 | 2,768 | 2.6x |
+| 16 | 3,170 | 2.9x |
+| 32 | 3,113 | 2.9x (saturated) |
 
-| # | Item | Description | Est. |
-|---|------|-------------|------|
-| P2-1 | Remaining unwrap audit | Replace all 112 non-test unwrap() with proper error handling or assert with safety comment | 2h |
-| P2-2 | Remaining `let _ =` audit | Replace 23 silent error drops with log or propagation | 1h |
+**Issue**: Scalability saturates at 8T (only 2.9x at 16T). Root cause: BTree split_mutex serializes all index inserts; page-level ContentLock contention on district pages.
 
-### Phase 2D: Test Hardening
+### 1.3 WAL Mode Performance
 
-| # | Item | Description | Est. |
-|---|------|-------------|------|
-| T-1 | Vacuum + concurrent DML test | Concurrent insert/update + vacuum, verify no panic | 0.5h |
-| T-2 | Long transaction memory test | Insert 100K rows in one txn, verify memory bounded | 0.5h |
-| T-3 | Engine lockfile test | Two Engine::open on same dir, verify second fails | 0.5h |
-| T-4 | Full regression | 1,024+ tests 0 fail, ASan clean, TPCC no regression | 0.5h |
+| Mode | TPS | Overhead |
+|------|-----|----------|
+| No WAL | 4,959 | — |
+| **With WAL** | **602** | **-88%** |
+
+**CRITICAL**: WAL mode is unusable for production. Root cause: `Transaction::commit()` calls `writer.wait_for_lsn()` which blocks until WAL fsync completes — **every commit pays a full fsync**. Should use group commit (batch fsync in background thread, commit just writes to OS page cache).
+
+### 1.4 Long-Running Stability (5 min, 5W/8T)
+
+| Duration | TPS |
+|----------|-----|
+| 15s | 4,288 |
+| **300s** | **1,168** |
+
+**CRITICAL**: 73% TPS degradation over 5 minutes. Root cause candidates:
+- Dead tuple accumulation (autovacuum may not keep up)
+- Buffer pool fill + eviction overhead
+- FSM not finding free space efficiently
+
+### 1.5 vs C++ dstore
+
+| Metric | FerrisDB (Rust) | dstore (C++) | Assessment |
+|--------|----------------|--------------|------------|
+| 20W/20T no-WAL | 3,170 TPS | ~2,500-3,000 TPS | **Comparable** |
+| WAL mode | 602 TPS | ~2,000+ TPS (group commit) | **3x slower** |
+| Thread scalability | 2.9x at 16T | ~3-4x (partitioned locks) | **Weaker** |
+| Long-running | 73% degradation at 5min | Stable (autovacuum + FSM) | **Much weaker** |
 
 ---
 
-## 3. Regression Checklist
+## 2. Critical Gaps
+
+### GAP-1: WAL Group Commit (Blocks production WAL mode)
+
+**Current**: Every `commit()` calls `wait_for_lsn()` → synchronous fsync.
+**Target**: Write WAL record to OS page cache → return immediately. Background flusher batches fsync every 5-100ms. Multiple commits share one fsync (group commit).
+
+**File**: `transaction/mod.rs:314`
+**Fix**: Remove `wait_for_lsn()` from normal commit path. Only wait on `synchronous_commit = true` (configurable).
+
+**Impact**: WAL mode TPS should improve from 602 → ~3,000+ (5x improvement).
+
+### GAP-2: Long-Running TPS Degradation
+
+**Root cause analysis needed**. Candidates:
+- Dead tuple accumulation → scan overhead grows
+- Buffer pool dirty page ratio increasing → more eviction I/O
+- FSM roving pointer not finding free pages as table grows
+
+**Fix**: Profile 5-minute run, identify dominant cost. Likely need more aggressive vacuum or smarter FSM.
+
+### GAP-3: Insert-then-WAL-fail Leaves Orphaned Tuple
+
+**Current**: `insert()` writes tuple to page BEFORE writing WAL. If WAL fails, tuple is in buffer pool but not in undo log.
+**Fix**: Record undo FIRST (or at least atomically with page write). If WAL fails after page write, the undo action must still be in memory undo_log.
+
+**File**: `heap/mod.rs:306-324`
+
+### GAP-4: BTree WAL Error Silently Swallowed
+
+**Current**: `wal_write_insert()` ignores WAL write errors.
+**Fix**: Return `Result`, propagate to caller. Index insert that can't be WAL-logged should fail.
+
+**File**: `btree.rs:626-630`
+
+### GAP-5: Error Messages Lack Debug Context
+
+**Current**: "Tuple not found during update" — no table, page, offset info.
+**Fix**: Include `table_oid`, `page_no`, `tuple_offset` in all DML error messages.
+
+### GAP-6: BTree Free Page List Not Persisted
+
+**Current**: `free_pages: Mutex<Vec<u32>>` is memory-only. Crash → recycled pages lost → file bloat.
+**Fix**: Persist free list to catalog on checkpoint or shutdown.
+
+---
+
+## 3. Fix Plan (Priority Order)
+
+### Phase 3A: Performance (must fix for production competitiveness)
+
+| # | Item | Description | Impact |
+|---|------|-------------|--------|
+| **G1** | WAL group commit | Remove wait_for_lsn from commit(); let flusher batch fsync | WAL TPS 602→3000+ |
+| **G2** | Long-run stability | Profile + fix 5-min degradation (vacuum/FSM/buffer) | Stable throughput |
+
+### Phase 3B: Data Safety
+
+| # | Item | Description | Impact |
+|---|------|-------------|--------|
+| **G3** | Insert WAL ordering | Ensure undo recorded before/atomically with page write | No orphan tuples |
+| **G4** | BTree WAL propagation | wal_write_insert returns Result | No silent index loss |
+
+### Phase 3C: Operational Quality
+
+| # | Item | Description | Impact |
+|---|------|-------------|--------|
+| **G5** | Error message context | Add table/page/offset to all DML errors | Debuggability |
+| **G6** | BTree free page persist | Save free_pages on checkpoint | No file bloat |
+
+### Phase 3D: Enterprise Test Suite
+
+| # | Item | Description |
+|---|------|-------------|
+| **T1** | WAL mode TPCC: 5W/16T/60s > 2,000 TPS | Validates group commit |
+| **T2** | 5-minute stability: TPS drop < 20% | Validates long-run |
+| **T3** | 50W scalability: TPS > 3,000 | Validates large working set |
+| **T4** | Deadlock under load: 20W/20T/60s 0 hangs | Validates lock mgr |
+| **T5** | WAL crash recovery e2e with Engine | Full lifecycle |
+
+---
+
+## 4. Regression Checklist
 
 ```bash
 # 1. Full test suite
@@ -127,34 +158,38 @@ RUSTFLAGS="-Z sanitizer=address -Cunsafe-allow-abi-mismatch=sanitizer" \
   cargo +nightly test -p ferrisdb-storage -p ferrisdb-transaction \
   --target x86_64-unknown-linux-gnu -- --test-threads=1
 
-# 3. TPCC
-cargo run --release --bin tpcc -- \
-  --warehouses 20 --threads 20 --duration 30 --buffer-size 300000
+# 3. TPCC no-WAL (baseline)
+cargo run --release --bin tpcc -- --warehouses 5 --threads 16 --duration 20 --buffer-size 100000
 
-# 4. Concurrent stability
+# 4. TPCC WAL mode (must be > 2,000 TPS after G1)
+cargo run --release --bin tpcc -- --warehouses 5 --threads 16 --duration 20 --buffer-size 100000 --wal
+
+# 5. Long-run stability (TPS drop < 20% at 5min)
+cargo run --release --bin tpcc -- --warehouses 5 --threads 8 --duration 300 --buffer-size 100000
+
+# 6. Concurrent stability
 for i in $(seq 1 30); do
   cargo test -p ferrisdb-storage --test btree_tests test_btree_concurrent_insert 2>&1 | grep -q FAILED && echo "FAIL $i"
 done
 
-# 5. Sanitizer suite
+# 7. Sanitizer suite
 bash scripts/sanitizer_check.sh
 ```
 
 ---
 
-## 4. Progress Tracking
+## 5. Progress Tracking
 
 | Phase | Item | Status | Date |
 |-------|------|--------|------|
-| P0-1 | HeapTable unwrap → Result | **DONE** | 2026-04-06 |
-| P0-2 | Undo WAL error propagation | **DONE** | 2026-04-06 |
-| P0-3 | Undo log size limit (1M actions) | **DONE** | 2026-04-06 |
-| P0-4 | Engine lockfile (`flock`) | **DONE** | 2026-04-06 |
-| P1-1 | BTree recovery insert validation | **DONE** | 2026-04-06 |
-| P1-2 | Recovery page checksum | **DONE** | 2026-04-06 |
-| P2-1 | unwrap audit | Deferred (hot path fixed, remaining are non-critical) | |
-| P2-2 | `let _ =` audit | Deferred (critical paths fixed in Phase 1) | |
-| T-1 | Vacuum + concurrent DML test | **DONE** (`phase2_hardening_tests.rs`) | 2026-04-06 |
-| T-2 | Undo log limit test | **DONE** (`phase2_hardening_tests.rs`) | 2026-04-06 |
-| T-3 | Engine lockfile test | **DONE** (`persistence_tests.rs`) | 2026-04-06 |
-| T-4 | Full regression: 1,027 tests 0 fail | **DONE** | 2026-04-06 |
+| G1 | WAL group commit | PENDING | |
+| G2 | Long-run stability fix | PENDING | |
+| G3 | Insert WAL ordering | PENDING | |
+| G4 | BTree WAL propagation | PENDING | |
+| G5 | Error message context | PENDING | |
+| G6 | BTree free page persist | PENDING | |
+| T1 | WAL mode TPCC > 2,000 TPS | PENDING | |
+| T2 | 5-min stability < 20% drop | PENDING | |
+| T3 | 50W scalability | Deferred | |
+| T4 | Deadlock under load | PENDING | |
+| T5 | WAL crash recovery e2e | PENDING | |

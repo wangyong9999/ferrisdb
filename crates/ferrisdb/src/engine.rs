@@ -469,6 +469,8 @@ impl Engine {
         if meta.current_pages > 0 {
             btree.set_next_page(meta.current_pages);
         }
+        // 恢复 free pages
+        self.restore_index_free_pages(name, &btree);
         Ok(btree)
     }
 
@@ -476,7 +478,29 @@ impl Engine {
     pub fn save_index_state(&self, name: &str, btree: &ferrisdb_storage::BTree) -> Result<()> {
         let meta = self.catalog.lookup_by_name(name)
             .ok_or_else(|| FerrisDBError::NotFound(format!("Index '{}' not found", name)))?;
-        self.catalog.update_pages(meta.oid, btree.next_page_count(), btree.root_page())
+        self.catalog.update_pages(meta.oid, btree.next_page_count(), btree.root_page())?;
+        // 持久化 free pages 列表
+        let free_pages = btree.get_free_pages();
+        if !free_pages.is_empty() {
+            let path = self.data_dir.join(format!("idx_{}.freepages", name));
+            let data: Vec<u8> = free_pages.iter().flat_map(|p| p.to_le_bytes()).collect();
+            std::fs::write(&path, &data)
+                .map_err(|e| FerrisDBError::Internal(format!("Failed to save free pages: {}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// 恢复索引的 free pages 列表
+    fn restore_index_free_pages(&self, name: &str, btree: &ferrisdb_storage::BTree) {
+        let path = self.data_dir.join(format!("idx_{}.freepages", name));
+        if let Ok(data) = std::fs::read(&path) {
+            let pages: Vec<u32> = data.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            if !pages.is_empty() {
+                btree.set_free_pages(pages);
+            }
+        }
     }
 
     // ==================== 访问内部组件 ====================

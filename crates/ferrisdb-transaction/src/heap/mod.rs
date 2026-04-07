@@ -266,14 +266,14 @@ impl HeapTable {
 
     /// 写入 WAL 记录
     ///
-    /// WAL 模式优化：先尝试 WalBuffer（无锁 atomic），满了则 fallback 到 WalWriter。
+    /// 快速路径：WalBuffer 无锁 atomic 写入（高并发场景）。
+    /// WalBuffer 满时 fallback 到 WalWriter（有 Mutex，低频）。
     #[inline]
     fn wal_write(&self, record_data: &[u8]) -> ferrisdb_core::Result<()> {
         if let Some(ref buf) = self.wal_buffer {
             if buf.write(record_data).is_ok() {
-                return Ok(()); // 快速路径：无锁写入成功
+                return Ok(());
             }
-            // Buffer 满：fallback 到 WalWriter（有 Mutex，但只在 buffer 满时走）
         }
         if let Some(ref writer) = self.wal_writer {
             writer.write(record_data)?;

@@ -368,7 +368,7 @@ impl TpccTables {
         let tm = &txn_mgr;
         // WAL 模式：DML 写入 WalBuffer（无锁），commit 写入 WalWriter
         let wal_buf: Option<Arc<ferrisdb_storage::WalBuffer>> = if wal_writer.is_some() {
-            Some(Arc::new(ferrisdb_storage::WalBuffer::new(128 * 1024 * 1024))) // 128MB for long runs
+            Some(Arc::new(ferrisdb_storage::WalBuffer::new(128 * 1024 * 1024))) // 128MB
         } else {
             None
         };

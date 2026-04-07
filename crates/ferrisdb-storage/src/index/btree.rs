@@ -734,9 +734,10 @@ impl BTree {
 
     /// 插入键值对（允许重复 key）
     ///
-    /// split_mutex 保护 insert+split 路径。完整的 B-link tree lock coupling
-    /// 需要 leaf→parent latch crabbing + right-link protocol，是后续优化项。
-    /// 当前 split_mutex 确保并发正确性，lookup 通过 right-link 不受影响。
+    /// split_mutex 保护 insert+split 路径，确保并发正确性。
+    /// 完整的 B-link tree incomplete-split 协议需要 split_status 标记 +
+    /// CompleteSplit 协助机制 + find_parent 重搜索，是 1-2 周专项工程。
+    /// 当前方案对 HeapTable insert（不走 BTree）和 lookup/scan 无影响。
     pub fn insert(&self, key: BTreeKey, value: BTreeValue) -> ferrisdb_core::Result<()> {
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
         let _guard = self.split_mutex.lock();

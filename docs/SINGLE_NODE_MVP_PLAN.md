@@ -205,7 +205,7 @@ bash scripts/sanitizer_check.sh
 
 | # | Item | Status | Date |
 |---|------|--------|------|
-| W1b | WalBuffer flusher | **DONE** — 128MB buffer + fallback 稳定。>30s 运行需环形 buffer（后续） | 2026-04-07 |
+| W1b | WalBuffer flusher | **DONE** — WAL load 阶段 disable（0.27s），benchmark 阶段 enable。128MB 支持 ~10s 高速，之后 fallback。需 drain 线程实现持续高速 | 2026-04-07 |
 | F3b | Engine 集成 BTree free pages | **DONE** — save_index_state 持久化 free pages 文件，open_index 恢复 | 2026-04-07 |
 | C1 | B-link tree SMO 协议 | **已知限制** — 需完整 latch crabbing，保持 split_mutex 确保正确性 | |
 

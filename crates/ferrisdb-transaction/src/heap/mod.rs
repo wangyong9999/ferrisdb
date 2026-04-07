@@ -99,6 +99,8 @@ pub struct HeapTable {
     wal_buffer: Option<Arc<WalBuffer>>,
     /// WAL Writer (optional, 磁盘持久化)
     wal_writer: Option<Arc<WalWriter>>,
+    /// WAL 写入总开关（数据加载期间禁用，benchmark 阶段启用）
+    wal_enabled: std::sync::atomic::AtomicBool,
     /// 当前页面数量
     current_page: std::sync::atomic::AtomicU32,
     /// Free Space Map: 每页 1 byte 空闲等级 (0=满, 255=空)
@@ -123,6 +125,7 @@ impl HeapTable {
             fsm: (0..65536).map(|_| std::sync::atomic::AtomicU8::new(255)).collect(),
             fsm_max_page: std::sync::atomic::AtomicU32::new(0),
             fsm_search_hint: std::sync::atomic::AtomicU32::new(0),
+            wal_enabled: std::sync::atomic::AtomicBool::new(true), // 默认启用
         }
     }
 
@@ -143,6 +146,7 @@ impl HeapTable {
             fsm: (0..65536).map(|_| std::sync::atomic::AtomicU8::new(255)).collect(),
             fsm_max_page: std::sync::atomic::AtomicU32::new(0),
             fsm_search_hint: std::sync::atomic::AtomicU32::new(0),
+            wal_enabled: std::sync::atomic::AtomicBool::new(true), // 默认启用
         }
     }
 
@@ -163,6 +167,7 @@ impl HeapTable {
             fsm: (0..65536).map(|_| std::sync::atomic::AtomicU8::new(255)).collect(),
             fsm_max_page: std::sync::atomic::AtomicU32::new(0),
             fsm_search_hint: std::sync::atomic::AtomicU32::new(0),
+            wal_enabled: std::sync::atomic::AtomicBool::new(true), // 默认启用
         }
     }
 
@@ -170,6 +175,16 @@ impl HeapTable {
     /// 设置 WAL Buffer（用于 DML 无锁写入）
     pub fn set_wal_buffer(&mut self, buf: Arc<WalBuffer>) {
         self.wal_buffer = Some(buf);
+    }
+
+    /// 启用 WAL 写入（数据加载完成后调用）
+    pub fn enable_wal(&self) {
+        self.wal_enabled.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 禁用 WAL 写入（数据加载期间调用，避免 WAL Mutex 拖慢加载）
+    pub fn disable_wal(&self) {
+        self.wal_enabled.store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// 设置 WAL Writer（用于 commit 持久化）
@@ -270,11 +285,16 @@ impl HeapTable {
     /// WalBuffer 满时 fallback 到 WalWriter（有 Mutex，低频）。
     #[inline]
     fn wal_write(&self, record_data: &[u8]) -> ferrisdb_core::Result<()> {
+        if !self.wal_enabled.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(()); // WAL 禁用（数据加载阶段）
+        }
+        // WalBuffer 快速路径
         if let Some(ref buf) = self.wal_buffer {
             if buf.write(record_data).is_ok() {
                 return Ok(());
             }
         }
+        // Fallback 到 WalWriter
         if let Some(ref writer) = self.wal_writer {
             writer.write(record_data)?;
         }

@@ -407,6 +407,23 @@ impl TpccTables {
             idx_order_cust: ShardedIndex::new(110, buffer_pool, false), // IDX 110 for order-by-cust
         }
     }
+
+    /// 启用所有表的 WalBuffer 快速路径（数据加载完成后调用）
+    /// 禁用所有表的 WAL 写入（数据加载阶段）
+    fn disable_wal(&self) {
+        for t in [&self.warehouse, &self.district, &self.customer, &self.item,
+                  &self.stock, &self.order, &self.new_order, &self.order_line, &self.history] {
+            t.disable_wal();
+        }
+    }
+
+    /// 启用所有表的 WAL 写入（benchmark 阶段）
+    fn enable_wal(&self) {
+        for t in [&self.warehouse, &self.district, &self.customer, &self.item,
+                  &self.stock, &self.order, &self.new_order, &self.order_line, &self.history] {
+            t.enable_wal();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1846,6 +1863,11 @@ fn main() {
     // Create all TPCC tables + indexes
     let tables = Arc::new(TpccTables::new(Arc::clone(&buffer_pool), Arc::clone(&txn_manager), args.customers, wal_writer.clone()));
 
+    // 数据加载阶段禁用 WAL（避免 WalWriter Mutex 拖慢批量插入）
+    if wal_writer.is_some() {
+        tables.disable_wal();
+    }
+
     // Load data
     let load_start = Instant::now();
     println!("Loading TPC-C data...");
@@ -1859,6 +1881,11 @@ fn main() {
     let load_elapsed = load_start.elapsed();
     println!("Data loaded in {:.2}s", load_elapsed.as_secs_f64());
     println!();
+
+    // 数据加载完成后启用 WAL（加载期间禁用以避免 Mutex 争用拖慢）
+    if wal_writer.is_some() {
+        tables.enable_wal();
+    }
 
     // Run benchmark
     let stats = Arc::new(Stats::new());

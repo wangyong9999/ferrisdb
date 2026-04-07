@@ -308,11 +308,12 @@ impl Transaction {
         // 1. 先写 WAL commit record（确保持久化）
         // 2. 标记 active=false（防止 Drop 触发 abort）
         // 3. 设 CSN 和状态（使其对其他事务可见）
+        // Group commit: 写 WAL commit record 到 OS page cache，不等 fsync
+        // 后台 flusher 线程 5ms 批量 fsync（多 commit 共享一次 fsync）
         if let Some(ref writer) = self.wal_writer {
             let commit_rec = WalTxnCommit::new(self.info.xid, csn.raw());
-            if let Ok(commit_lsn) = writer.write(&commit_rec.to_bytes()) {
-                let _ = writer.wait_for_lsn(commit_lsn);
-            }
+            writer.write(&commit_rec.to_bytes())?;
+            writer.notify_sync();
         }
 
         // WAL 已持久化，先禁用 Drop 的 auto-abort（即使后续 panic 也不会回滚已提交事务）

@@ -433,6 +433,14 @@ impl WalWriter {
         Ok(result)
     }
 
+    /// 通知后台 flusher 尽快 sync（group commit 唤醒）
+    ///
+    /// 非阻塞：只 unpark flusher 线程，不等待 sync 完成。
+    pub fn notify_sync(&self) {
+        let key = &self.flushed_lsn as *const AtomicU64 as usize;
+        unsafe { parking_lot_core::unpark_one(key, |_| parking_lot_core::DEFAULT_UNPARK_TOKEN); }
+    }
+
     /// 关闭 Writer
     pub fn close(&self) -> Result<()> {
         self.sync()?;

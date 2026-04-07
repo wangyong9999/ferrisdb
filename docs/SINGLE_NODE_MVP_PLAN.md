@@ -182,7 +182,7 @@ bash scripts/sanitizer_check.sh
 
 | Phase | Item | Status | Date |
 |-------|------|--------|------|
-| G1 | WAL group commit | PENDING | |
+| G1 | WAL group commit | **PARTIAL** — commit 不等 fsync (notify_sync), 但 DML 每次仍走 WalWriter Mutex。需要 DML 走 WalBuffer 无锁路径 | 2026-04-07 |
 | G2 | Long-run stability fix | PENDING | |
 | G3 | Insert WAL ordering | PENDING | |
 | G4 | BTree WAL propagation | PENDING | |

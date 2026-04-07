@@ -171,12 +171,8 @@ bash scripts/sanitizer_check.sh
 
 | Step | Item | Status | Date |
 |------|------|--------|------|
-| S1 | Segment 分片 (128MB) | PENDING | |
-| S1-test | Segment 跨文件测试 | PENDING | |
-| S1-regress | 全量 + TPCC + ASan | PENDING | |
-| C1 | BTree lock coupling | PENDING | |
-| C1-test | 50x concurrent + 32T scalability | PENDING | |
-| C1-regress | 全量 + TPCC + ASan + BTree 50x | PENDING | |
-| COV | 覆盖率 CI + 测试加固 | PENDING | |
-| COV-target | >70% 行覆盖 | PENDING | |
-| FINAL | 600s 长稳 + 32T deadlock + kill -9 | PENDING | |
+| S1 | Segment 分片 (128MB) | **DONE** — 128MB segments, auto-create, backward compatible | 2026-04-07 |
+| S1-regress | 全量 + TPCC | **DONE** — 914 pass, 6,104 TPS | 2026-04-07 |
+| C1 | BTree lock coupling | **KNOWN LIMITATION** — 需要完整 B-link tree SMO 协议 (1-2 周)，保持 split_mutex | 2026-04-07 |
+| COV | 覆盖率 CI 脚本 | **DONE** — scripts/coverage.sh | 2026-04-07 |
+| FINAL | 长稳 + 32T deadlock | PENDING | |

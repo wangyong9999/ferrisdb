@@ -734,10 +734,9 @@ impl BTree {
 
     /// 插入键值对（允许重复 key）
     ///
-    /// split_mutex 保护整个 insert+split 路径（保证并发正确性）。
-    /// Lookup（读）不受影响，通过 page lock + right-link 保证安全。
-    /// 注：完整的 B-link tree 乐观协议需要 leaf→parent latch crabbing，
-    /// 这是后续优化项（C++ dstore 实现了完整的 SMO 协议）。
+    /// split_mutex 保护 insert+split 路径。完整的 B-link tree lock coupling
+    /// 需要 leaf→parent latch crabbing + right-link protocol，是后续优化项。
+    /// 当前 split_mutex 确保并发正确性，lookup 通过 right-link 不受影响。
     pub fn insert(&self, key: BTreeKey, value: BTreeValue) -> ferrisdb_core::Result<()> {
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
         let _guard = self.split_mutex.lock();

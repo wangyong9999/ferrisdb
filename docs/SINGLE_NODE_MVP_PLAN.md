@@ -1,127 +1,121 @@
-# FerrisDB Phase 5 — Production 24/7 Reliability
+# FerrisDB Phase 6 — 40TB Enterprise Single-Node Readiness
 
 > Created: 2026-04-07
-> Baseline: commit 577f825 (1,031 tests, 0 failures)
-> WAL TPS: 5,282 | No-WAL TPS: 7,108
-> Previous: [Phase 1](MVP_PHASE1_COMPLETED.md) | [Phase 2](MVP_PHASE2_COMPLETED.md) | [Phase 3](MVP_PHASE3_COMPLETED.md) | [Phase 4](MVP_PHASE4_COMPLETED.md)
+> Baseline: commit b9def90
+> Previous: [P1](MVP_PHASE1_COMPLETED.md) | [P2](MVP_PHASE2_COMPLETED.md) | [P3](MVP_PHASE3_COMPLETED.md) | [P4](MVP_PHASE4_COMPLETED.md) | [P5](MVP_PHASE5_COMPLETED.md)
 
 ---
 
-## 1. 已达成能力
+## 1. 诚实现状：能做什么，不能做什么
 
-| 能力 | 状态 | 数据 |
+### 1.1 已达标（可商用）
+
+| 能力 | 数据 | 评估 |
 |------|------|------|
-| ACID + MVCC | ✅ | CSN-based snapshot isolation |
-| WAL + CRC32 + crash recovery | ✅ | Redo + undo 端到端验证 |
-| WAL 无锁写入 | ✅ | RingBuffer + drain，overhead 26% |
-| Checkpoint + WAL 截断 | ✅ | 60s 自动，drain wait |
-| AutoVacuum + FSM 更新 | ✅ | 10s 后台，vacuum 写 WAL |
-| Page checksum on read/write | ✅ | CRC32C 双向校验 |
-| BufTable 128 分区锁 | ✅ | 减少 writer 阻塞 reader |
-| 事务超时 + 强制 abort | ✅ | 30s 默认，后台扫描 |
-| Engine lockfile | ✅ | flock 互斥 |
-| Graceful shutdown | ✅ | 等待事务 + drain + checkpoint + fsync |
-| EngineStats API | ✅ | 运维监控 |
-| BTree free page 持久化 | ✅ | Engine save/restore |
-| 7 项 WAL 可靠性修复 | ✅ | Commit 保序、abort 传播、vacuum WAL 等 |
-| ASan clean | ✅ | 0 errors |
-| 并发稳定性 | ✅ | BTree 30x、LockManager 30x、20W/32T 0 deadlock |
+| ACID 事务 + MVCC | CSN snapshot isolation | ✅ 正确 |
+| WAL 持久性 | CRC32 + crash recovery (redo+undo) | ✅ 端到端验证 |
+| WAL 性能 | 5,282 TPS (26% overhead) | ✅ 可用 |
+| Checkpoint | 60s 自动 + WAL 截断 + ring drain wait | ✅ |
+| Page checksum | CRC32C on read+write | ✅ |
+| 并发安全 | 20W/32T 0 deadlock, ASan clean | ✅ |
+| Eviction 安全 | flush 失败不丢页面 | ✅ |
+| DDL/DML 隔离 | Metadata lock | ✅ |
+| WAL 300s 长稳 | 无 hang/crash/panic | ✅ |
 
-## 2. 深度分析：24/7 生产残留风险
+### 1.2 不达标（阻塞 40TB 商用）
 
-### 2.1 CRITICAL — 会导致数据损坏或丢失
+| 问题 | 现状 | 40TB 需要 | 差距 |
+|------|------|----------|------|
+| **page_no u32 溢出** | max 4.3B pages = 32TB | 5B+ pages | **需要 u64 或 segment 分片** |
+| **单文件无分段** | 1 relation = 1 file | ext4 max 16TB per file | **需要 1GB segment 分片** |
+| **BTree insert 串行** | split_mutex 全局锁 | 32T+ 高并发 | **需要 latch crabbing** |
+| **WAL 长稳衰减** | 300s: 84% TPS 下降 | 24/7 稳定 | **TPCC HashMap 问题，真实 BTree 待验证** |
+| **Undo 内存限制** | 1M actions (~100MB) | 大批量事务 | **需要 spill-to-disk** |
+| **100W TPS 低** | 649 TPS (100W/16T) | >3,000 TPS | **TPCC HashMap 瓶颈，非引擎** |
+| **无 PITR** | WAL 截断后不可恢复 | 任意时间点恢复 | **需要 WAL 归档** |
+| **无备份恢复** | 无 | 在线热备 | **需要 pg_basebackup 类工具** |
 
-| # | 问题 | 场景 | 根因 |
-|---|------|------|------|
-| **R1** | **Disk full → page 丢失** | 磁盘满时 eviction flush 失败，page 从 buffer pool 清除但未落盘 | `flush_buffer` 失败后 page 已被替换，数据永久丢失 |
-| **R2** | **DDL + DML 竞态** | `DROP TABLE` 和 `INSERT` 并发，OID 重用 | 无表级锁，catalog 立即删除 |
+### 1.3 vs C++ dstore 硬差距
 
-### 2.2 HIGH — 会导致系统不可用
-
-| # | 问题 | 场景 | 根因 |
-|---|------|------|------|
-| **R3** | **WAL 文件无限积累** | 长事务阻止 checkpoint 推进 → WAL 不截断 → 磁盘满 | 无 WAL 最大保留策略 |
-| **R4** | **长事务 undo 内存** | 100M 行批量导入，undo_log 在 1M 行处报错 | 无 undo spill-to-disk |
-
-### 2.3 MEDIUM — 影响运维或性能
-
-| # | 问题 | 场景 | 根因 |
-|---|------|------|------|
-| **R5** | **Slot 耗尽错误不友好** | 65 连接时 "NoFreeSlot" 无上下文 | 错误信息缺少 current/max |
-| **R6** | **无监控告警集成** | WAL 积累、undo 增长、disk 占用无告警 | 仅 eprintln |
-
-### 2.4 vs C++ dstore 架构差距
-
-| 能力 | C++ dstore | FerrisDB | 差距影响 |
+| 能力 | C++ dstore | FerrisDB | 商用影响 |
 |------|-----------|----------|---------|
-| BTree 并发 insert | Page-level latch crabbing + SMO | 全局 split_mutex | 16T+ insert 串行化 |
-| WAL 多流 | NUMA-aware 多 WalStream | 单 RingBuffer | NUMA 服务器 scalability |
-| Undo 系统 | 1M zone + varint + 异步 rollback worker | 内存 Vec + 同步 abort | 长事务受限 |
-| 表级锁/MDL | Metadata Lock 保护 DDL/DML | 无 | DDL+DML 竞态 |
-| CR Page | CSN-based 一致读页构造 | 无 | 长查询可能读到不一致 |
+| **数据文件分段** | 1GB segment files | 单文件无限增长 | ext4 16TB 限制 |
+| **BTree 并发** | Page-level latch crabbing | split_mutex 串行 | 16T+ scalability |
+| **Undo 系统** | 1M zone + varint + spill + async worker | 内存 Vec 1M 限制 | 大事务 |
+| **WAL 多流** | NUMA-aware 多 WalStream | 单 RingBuffer | 多 socket |
+| **CR Page** | CSN 一致读页构造 | 无 | 长事务读一致性 |
+| **系统表** | 完整 bootstrap + WAL | HashMap catalog | 元数据恢复 |
 
 ---
 
-## 3. Fix Plan
+## 2. 40TB 商用路线图
 
-### Phase 5A: P0 — 数据安全（阻塞商用）
+### Phase 6A: 存储容量（不做就物理不支持 40TB）
 
-| # | Item | Description | Est. |
-|---|------|-------------|------|
-| R1 | Eviction flush 失败保护 | flush 失败时不替换 buffer，选另一个 victim | 1h |
-| R2 | 表级 metadata lock | DDL 前取排他 MDL，DML 前取共享 MDL | 2h |
+| # | Item | Description | Est. | Blocks |
+|---|------|-------------|------|--------|
+| **S1** | 数据文件 1GB 分段 | relation 由多个 1GB segment 组成，smgr 按 (oid, seg_no, page_no) 寻址 | 3d | 40TB 基础 |
+| **S2** | page_no 扩展 | HeapTable/BTree 内部用 (seg_no: u32, page_no: u32) 或直接 u64 | 2d | 40TB 基础 |
 
-### Phase 5B: P1 — 系统可用性
+### Phase 6B: 并发扩展（不做就 32T+ 不可用）
 
-| # | Item | Description | Est. |
-|---|------|-------------|------|
-| R3 | WAL 最大保留 + 紧急清理 | 配置 max_wal_size，超限触发紧急 checkpoint | 1h |
-| R4 | 大事务分批提示 | 改善错误信息，建议 "commit every N rows" | 0.5h |
-| R5 | Slot 错误上下文 | 错误包含 current_slots/max_slots | 0.5h |
+| # | Item | Description | Est. | Blocks |
+|---|------|-------------|------|--------|
+| **C1** | BTree latch crabbing | leaf split 用 page lock + right-link；insert 正常路径无全局锁 | 5d | 高并发 |
+| **C2** | WAL 多 RingBuffer | 2-4 个 RingBuffer 按线程 hash 分发，减少 drain 瓶颈 | 2d | 多核 |
 
-### Phase 5C: P2 — 运维与长稳
+### Phase 6C: 大事务（不做就批量导入受限）
 
-| # | Item | Description | Est. |
-|---|------|-------------|------|
-| R6 | Engine health check | EngineStats 加 wal_size_bytes、undo_max_size、disk_usage | 1h |
-| T1 | 长稳压力测试 | TPCC WAL 5W/16T/300s 完成无 hang/crash/OOM | 验证 |
-| T2 | Disk full 模拟测试 | 注入 IO error → 验证 graceful degradation | 验证 |
+| # | Item | Description | Est. | Blocks |
+|---|------|-------------|------|--------|
+| **U1** | Undo spill-to-disk | undo_log 超阈值写临时文件，abort 时从文件读取 | 3d | 大批量 |
 
----
+### Phase 6D: 数据保护（不做就无法灾备）
 
-## 4. Regression Checklist
+| # | Item | Description | Est. | Blocks |
+|---|------|-------------|------|--------|
+| **D1** | WAL 归档 | checkpoint 后将旧 WAL 文件移到 archive 目录而非删除 | 1d | PITR |
+| **D2** | 在线热备 | snapshot + WAL stream 导出，支持 pg_basebackup 类操作 | 5d | 灾备 |
 
-```bash
-# Tests
-cargo test --all
+### Phase 6E: 稳定性加固
 
-# ASan
-RUSTFLAGS="-Z sanitizer=address -Cunsafe-allow-abi-mismatch=sanitizer" \
-  cargo +nightly test -p ferrisdb-storage -p ferrisdb-transaction \
-  --target x86_64-unknown-linux-gnu -- --test-threads=1
-
-# TPCC
-cargo run --release --bin tpcc -- --warehouses 5 --threads 16 --duration 20 --buffer-size 100000
-cargo run --release --bin tpcc -- --warehouses 5 --threads 16 --duration 20 --buffer-size 100000 --wal
-
-# WAL long-run (300s, verify no hang/crash)
-cargo run --release --bin tpcc -- --warehouses 5 --threads 8 --duration 300 --buffer-size 100000 --wal
-
-# Sanitizer suite
-bash scripts/sanitizer_check.sh
-```
+| # | Item | Description | Est. | Blocks |
+|---|------|-------------|------|--------|
+| **T1** | 真实 BTree 索引 TPCC | 替换 HashMap 为 BTree 索引，验证长稳 | 3d | 长稳验证 |
+| **T2** | 1TB 数据量压测 | 装载 1TB 数据，跑 24h TPCC，监控 TPS/内存/磁盘 | 2d | 容量验证 |
+| **T3** | 故障注入测试 | 磁盘满、网络断、进程 kill、电源断 | 2d | 可靠性 |
 
 ---
 
-## 5. Progress Tracking
+## 3. 优先级排序（到首商用的最短路径）
+
+### Tier 1: 必须做（无此不可商用）
+- **S1 + S2**: 文件分段 + page 寻址扩展（5d）→ 支持 >16TB
+- **C1**: BTree latch crabbing（5d）→ 32T+ 可用
+
+### Tier 2: 应该做（客户体验关键）
+- **U1**: Undo spill-to-disk（3d）→ 大批量导入
+- **D1**: WAL 归档（1d）→ PITR 基础
+- **T1**: BTree TPCC 验证（3d）→ 长稳数据
+
+### Tier 3: 增强（提升竞争力）
+- **C2**: 多 RingBuffer
+- **D2**: 在线热备
+- **T2 + T3**: 大容量 + 故障注入
+
+---
+
+## 4. 进度跟踪
 
 | Phase | Item | Status | Date |
 |-------|------|--------|------|
-| R1 | Eviction flush failure protection | **DONE** — flush 失败不替换 victim，返回错误 | 2026-04-07 |
-| R2 | Table-level metadata lock | **DONE** — DDL 排他锁，DML 共享锁 via get_table_lock() | 2026-04-07 |
-| R3 | WAL max retention | **DONE** — wal_size_threshold 触发紧急 checkpoint | 2026-04-07 |
-| R4 | Large txn error improvement | **DONE** — 包含当前/最大 action 数 + 建议分批 | 2026-04-07 |
-| R5 | Slot error context | **DONE** — 包含 active/max slots + 建议 | 2026-04-07 |
-| R6 | Engine health: wal_ring_unflushed | **DONE** — EngineStats 增加 ring buffer 监控 | 2026-04-07 |
-| T1 | WAL 300s stability | **DONE** — 5W/8T/300s WAL 完成，无 hang/crash/panic | 2026-04-07 |
-| T2 | ASan + TSan regression | **DONE** — ASan 829 pass 0 fail, TSan 无新 race | 2026-04-07 |
+| S1 | 数据文件 1GB 分段 | PENDING | |
+| S2 | page_no 扩展 | PENDING | |
+| C1 | BTree latch crabbing | PENDING | |
+| C2 | WAL 多 RingBuffer | PENDING | |
+| U1 | Undo spill-to-disk | PENDING | |
+| D1 | WAL 归档 | PENDING | |
+| D2 | 在线热备 | PENDING | |
+| T1 | BTree TPCC 验证 | PENDING | |
+| T2 | 1TB 压测 | PENDING | |
+| T3 | 故障注入 | PENDING | |

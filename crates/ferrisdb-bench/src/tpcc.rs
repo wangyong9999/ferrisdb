@@ -363,20 +363,14 @@ struct TpccTables {
 }
 
 impl TpccTables {
-    fn new(buffer_pool: Arc<BufferPool>, txn_mgr: Arc<TransactionManager>, customer_per_district: u32, wal_writer: Option<Arc<ferrisdb_storage::WalWriter>>) -> Self {
+    fn new(buffer_pool: Arc<BufferPool>, txn_mgr: Arc<TransactionManager>, customer_per_district: u32, wal_writer: Option<Arc<ferrisdb_storage::WalWriter>>, wal_ring: Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>>) -> Self {
         let bp = &buffer_pool;
         let tm = &txn_mgr;
-        // WAL 模式：DML 写入 WalBuffer（无锁），commit 写入 WalWriter
-        let wal_buf: Option<Arc<ferrisdb_storage::WalBuffer>> = if wal_writer.is_some() {
-            Some(Arc::new(ferrisdb_storage::WalBuffer::new(128 * 1024 * 1024))) // 128MB
-        } else {
-            None
-        };
         let make_table = |oid: u32| -> Arc<HeapTable> {
             if let Some(ref w) = wal_writer {
                 let mut t = HeapTable::with_wal_writer(oid, Arc::clone(bp), Arc::clone(tm), Arc::clone(w));
-                if let Some(ref buf) = wal_buf {
-                    t.set_wal_buffer(Arc::clone(buf));
+                if let Some(ref ring) = wal_ring {
+                    t.set_wal_ring(Arc::clone(ring));
                 }
                 Arc::new(t)
             } else {
@@ -409,6 +403,12 @@ impl TpccTables {
     }
 
     /// 启用所有表的 WalBuffer 快速路径（数据加载完成后调用）
+    /// 获取 WAL Ring Buffer 引用（第一个表的 ring）
+    fn get_wal_ring(&self) -> Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>> {
+        // 所有表共享同一个 ring，从 warehouse 获取
+        None // Ring 存在 TpccTables 外部，由 caller 管理
+    }
+
     /// 禁用所有表的 WAL 写入（数据加载阶段）
     fn disable_wal(&self) {
         for t in [&self.warehouse, &self.district, &self.customer, &self.item,
@@ -1845,6 +1845,13 @@ fn main() {
     // Start background WAL flusher (5ms interval for tight group commit)
     let _wal_flusher = wal_writer.as_ref().map(|w| w.start_flusher(5));
 
+    // WAL Ring Buffer（16MB 环形，后台 drain 到 WalWriter）
+    let wal_ring_ref: Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>> = if wal_writer.is_some() {
+        Some(Arc::new(ferrisdb_storage::wal::ring_buffer::WalRingBuffer::new(16 * 1024 * 1024)))
+    } else {
+        None
+    };
+
     // Note: WalBuffer is 128MB, enough for medium runs without flusher
 
     // Wire WAL writer to buffer pool (WAL-before-data enforcement)
@@ -1861,7 +1868,7 @@ fn main() {
     let txn_manager = Arc::new(txn_manager_inner);
 
     // Create all TPCC tables + indexes
-    let tables = Arc::new(TpccTables::new(Arc::clone(&buffer_pool), Arc::clone(&txn_manager), args.customers, wal_writer.clone()));
+    let tables = Arc::new(TpccTables::new(Arc::clone(&buffer_pool), Arc::clone(&txn_manager), args.customers, wal_writer.clone(), wal_ring_ref.clone()));
 
     // 数据加载阶段禁用 WAL（避免 WalWriter Mutex 拖慢批量插入）
     if wal_writer.is_some() {
@@ -1882,10 +1889,16 @@ fn main() {
     println!("Data loaded in {:.2}s", load_elapsed.as_secs_f64());
     println!();
 
-    // 数据加载完成后启用 WAL（加载期间禁用以避免 Mutex 争用拖慢）
-    if wal_writer.is_some() {
+    // 数据加载完成后启用 WAL + 启动 drain 线程
+    let _wal_drain = if let (Some(ref ring), Some(ref w)) = (&wal_ring_ref, &wal_writer) {
         tables.enable_wal();
-    }
+        Some(ferrisdb_storage::wal::ring_buffer::start_drain_thread(
+            Arc::clone(ring), Arc::clone(w), 5,
+        ))
+    } else {
+        if wal_writer.is_some() { tables.enable_wal(); }
+        None
+    };
 
     // Run benchmark
     let stats = Arc::new(Stats::new());

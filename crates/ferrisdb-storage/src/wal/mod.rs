@@ -40,6 +40,7 @@ mod parallel_redo;
 mod reader;
 mod record;
 mod recovery;
+pub mod ring_buffer;
 mod writer;
 
 pub use buffer::{WalBuffer, DEFAULT_WAL_BUFFER_SIZE};

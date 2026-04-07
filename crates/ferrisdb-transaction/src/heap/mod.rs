@@ -99,6 +99,8 @@ pub struct HeapTable {
     wal_buffer: Option<Arc<WalBuffer>>,
     /// WAL Writer (optional, 磁盘持久化)
     wal_writer: Option<Arc<WalWriter>>,
+    /// WAL Ring Buffer（无锁环形 buffer + 后台 drain）
+    wal_ring: Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>>,
     /// WAL 写入总开关（数据加载期间禁用，benchmark 阶段启用）
     wal_enabled: std::sync::atomic::AtomicBool,
     /// 当前页面数量
@@ -125,7 +127,8 @@ impl HeapTable {
             fsm: (0..65536).map(|_| std::sync::atomic::AtomicU8::new(255)).collect(),
             fsm_max_page: std::sync::atomic::AtomicU32::new(0),
             fsm_search_hint: std::sync::atomic::AtomicU32::new(0),
-            wal_enabled: std::sync::atomic::AtomicBool::new(true), // 默认启用
+            wal_ring: None,
+            wal_enabled: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -146,7 +149,8 @@ impl HeapTable {
             fsm: (0..65536).map(|_| std::sync::atomic::AtomicU8::new(255)).collect(),
             fsm_max_page: std::sync::atomic::AtomicU32::new(0),
             fsm_search_hint: std::sync::atomic::AtomicU32::new(0),
-            wal_enabled: std::sync::atomic::AtomicBool::new(true), // 默认启用
+            wal_ring: None,
+            wal_enabled: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -167,7 +171,8 @@ impl HeapTable {
             fsm: (0..65536).map(|_| std::sync::atomic::AtomicU8::new(255)).collect(),
             fsm_max_page: std::sync::atomic::AtomicU32::new(0),
             fsm_search_hint: std::sync::atomic::AtomicU32::new(0),
-            wal_enabled: std::sync::atomic::AtomicBool::new(true), // 默认启用
+            wal_ring: None,
+            wal_enabled: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -175,6 +180,11 @@ impl HeapTable {
     /// 设置 WAL Buffer（用于 DML 无锁写入）
     pub fn set_wal_buffer(&mut self, buf: Arc<WalBuffer>) {
         self.wal_buffer = Some(buf);
+    }
+
+    /// 设置 WAL Ring Buffer（无锁环形 buffer + 后台 drain）
+    pub fn set_wal_ring(&mut self, ring: Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>) {
+        self.wal_ring = Some(ring);
     }
 
     /// 启用 WAL 写入（数据加载完成后调用）
@@ -288,13 +298,18 @@ impl HeapTable {
         if !self.wal_enabled.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(()); // WAL 禁用（数据加载阶段）
         }
-        // WalBuffer 快速路径
+        // 优先级 1：WalRingBuffer（无锁环形 buffer + 后台 drain）
+        if let Some(ref ring) = self.wal_ring {
+            ring.write(record_data);
+            return Ok(());
+        }
+        // 优先级 2：WalBuffer（无锁线性 buffer）
         if let Some(ref buf) = self.wal_buffer {
             if buf.write(record_data).is_ok() {
                 return Ok(());
             }
         }
-        // Fallback 到 WalWriter
+        // Fallback：WalWriter（有 Mutex）
         if let Some(ref writer) = self.wal_writer {
             writer.write(record_data)?;
         }

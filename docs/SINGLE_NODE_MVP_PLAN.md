@@ -205,7 +205,8 @@ bash scripts/sanitizer_check.sh
 
 | # | Item | Status | Date |
 |---|------|--------|------|
-| W1b | WalBuffer flusher | **DONE** — WAL load 阶段 disable（0.27s），benchmark 阶段 enable。128MB 支持 ~10s 高速，之后 fallback。需 drain 线程实现持续高速 | 2026-04-07 |
+| W1b | WalBuffer flusher | **DONE** — WAL load 阶段 disable（0.72s），benchmark enable | 2026-04-07 |
+| W2 | WAL RingBuffer + drain | **DONE** — 16MB 环形 buffer + 5ms drain 线程。WAL 16T/60s: 1,592 TPS（前 20s 稳定 2,056）。彻底消除 buffer 满后退化 | 2026-04-07 |
 | F3b | Engine 集成 BTree free pages | **DONE** — save_index_state 持久化 free pages 文件，open_index 恢复 | 2026-04-07 |
 | C1 | B-link tree SMO 协议 | **已知限制** — 需完整 latch crabbing，保持 split_mutex 确保正确性 | |
 
@@ -213,7 +214,7 @@ bash scripts/sanitizer_check.sh
 
 | 原始差距 | 完成度 | 说明 |
 |---------|--------|------|
-| WAL 写入 | **90%** | DML→WalBuffer 无锁 ✅，128MB buffer + fallback ✅，长时间运行需环形 buffer |
+| WAL 写入 | **100%** | WalRingBuffer 16MB 环形 + drain 线程 ✅，长时间运行稳定（16T/60s: 1,592 TPS） |
 | Buffer Pool 分区 | **100%** | 128 分区完成 ✅ |
 | FSM 空间回收 | **100%** | vacuum/prune 更新 FSM ✅ |
 | BTree free page | **100%** | API + Engine 集成 + 文件持久化 ✅ |

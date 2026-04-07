@@ -13,83 +13,118 @@ use std::collections::HashMap;
 
 use crate::page::PAGE_SIZE;
 
-/// 文件句柄
-struct FileHandle {
-    /// 文件
+/// 每个 segment 的页面数 (128MB / 8KB = 16384)
+const PAGES_PER_SEGMENT: u32 = 16384;
+
+/// Segment 文件句柄
+struct SegmentFile {
     file: Mutex<File>,
-    /// 文件路径
     path: PathBuf,
-    /// 文件大小（页面数）
+}
+
+impl SegmentFile {
+    fn open_or_create(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true).write(true).create(true)
+            .open(path)
+            .map_err(|e| FerrisDBError::Io(e))?;
+        Ok(Self { file: Mutex::new(file), path: path.to_path_buf() })
+    }
+
+    fn read_page(&self, offset_in_seg: u32, buf: &mut [u8]) -> Result<()> {
+        let offset = offset_in_seg as u64 * PAGE_SIZE as u64;
+        let file = self.file.lock().map_err(|_| {
+            FerrisDBError::Io(std::io::Error::new(std::io::ErrorKind::Other, "lock"))
+        })?;
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset).map_err(|e| FerrisDBError::Io(e))
+    }
+
+    fn write_page(&self, offset_in_seg: u32, buf: &[u8]) -> Result<()> {
+        let offset = offset_in_seg as u64 * PAGE_SIZE as u64;
+        let file = self.file.lock().map_err(|_| {
+            FerrisDBError::Io(std::io::Error::new(std::io::ErrorKind::Other, "lock"))
+        })?;
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset).map_err(|e| FerrisDBError::Io(e))
+    }
+
+    fn sync(&self) -> Result<()> {
+        let file = self.file.lock().map_err(|_| {
+            FerrisDBError::Io(std::io::Error::new(std::io::ErrorKind::Other, "lock"))
+        })?;
+        file.sync_all().map_err(|e| FerrisDBError::Io(e))
+    }
+}
+
+/// 分段文件句柄（一个 relation 由多个 128MB segment 组成）
+struct FileHandle {
+    /// 基础路径（不含 segment 后缀）
+    base_path: PathBuf,
+    /// segment 文件（按需打开）
+    segments: Mutex<HashMap<u32, Arc<SegmentFile>>>,
+    /// 总页面数
     num_pages: std::sync::atomic::AtomicU64,
 }
 
 impl FileHandle {
     fn new(path: PathBuf) -> Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .map_err(|e| FerrisDBError::Io(e))?;
-
-        let metadata = file.metadata().map_err(|e| FerrisDBError::Io(e))?;
-        let num_pages = metadata.len() / PAGE_SIZE as u64;
+        let mut segments = HashMap::new();
+        let num_pages = if path.exists() {
+            let seg = Arc::new(SegmentFile::open_or_create(&path)?);
+            let meta = std::fs::metadata(&path).map_err(|e| FerrisDBError::Io(e))?;
+            segments.insert(0u32, seg);
+            meta.len() / PAGE_SIZE as u64
+        } else { 0 };
 
         Ok(Self {
-            file: Mutex::new(file),
-            path,
+            base_path: path,
+            segments: Mutex::new(segments),
             num_pages: std::sync::atomic::AtomicU64::new(num_pages),
         })
     }
 
-    fn read_page(&self, page_no: u32, buf: &mut [u8]) -> Result<()> {
-        let offset = page_no as u64 * PAGE_SIZE as u64;
-        let file = self.file.lock().map_err(|_| {
-            FerrisDBError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to lock file",
-            ))
+    /// 获取或打开 segment 文件
+    fn get_segment(&self, seg_no: u32) -> Result<Arc<SegmentFile>> {
+        let mut segs = self.segments.lock().map_err(|_| {
+            FerrisDBError::Io(std::io::Error::new(std::io::ErrorKind::Other, "segment lock"))
         })?;
+        if let Some(seg) = segs.get(&seg_no) {
+            return Ok(Arc::clone(seg));
+        }
+        let seg_path = if seg_no == 0 {
+            self.base_path.clone()
+        } else {
+            self.base_path.with_extension(format!("seg{}", seg_no))
+        };
+        let seg = Arc::new(SegmentFile::open_or_create(&seg_path)?);
+        segs.insert(seg_no, Arc::clone(&seg));
+        Ok(seg)
+    }
 
-        // Use read_exact_at (pread) to avoid seek syscall
-        use std::os::unix::fs::FileExt;
-        file.read_exact_at(buf, offset)
-            .map_err(|e| FerrisDBError::Io(e))?;
-
-        Ok(())
+    fn read_page(&self, page_no: u32, buf: &mut [u8]) -> Result<()> {
+        let seg_no = page_no / PAGES_PER_SEGMENT;
+        let offset = page_no % PAGES_PER_SEGMENT;
+        self.get_segment(seg_no)?.read_page(offset, buf)
     }
 
     fn write_page(&self, page_no: u32, buf: &[u8]) -> Result<()> {
-        let offset = page_no as u64 * PAGE_SIZE as u64;
-        let file = self.file.lock().map_err(|_| {
-            FerrisDBError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to lock file",
-            ))
-        })?;
-
-        // Use write_all_at (pwrite) to avoid seek syscall
-        use std::os::unix::fs::FileExt;
-        file.write_all_at(buf, offset)
-            .map_err(|e| FerrisDBError::Io(e))?;
-
-        // 更新页面数
+        let seg_no = page_no / PAGES_PER_SEGMENT;
+        let offset = page_no % PAGES_PER_SEGMENT;
+        self.get_segment(seg_no)?.write_page(offset, buf)?;
         let current = self.num_pages.load(std::sync::atomic::Ordering::Acquire);
         if page_no as u64 >= current {
             self.num_pages.store(page_no as u64 + 1, std::sync::atomic::Ordering::Release);
         }
-
         Ok(())
     }
 
     fn sync(&self) -> Result<()> {
-        let file = self.file.lock().map_err(|_| {
-            FerrisDBError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Failed to lock file",
-            ))
+        let segs = self.segments.lock().map_err(|_| {
+            FerrisDBError::Io(std::io::Error::new(std::io::ErrorKind::Other, "segment lock"))
         })?;
-        file.sync_all().map_err(|e| FerrisDBError::Io(e))
+        for seg in segs.values() { seg.sync()?; }
+        Ok(())
     }
 
     fn num_pages(&self) -> u64 {

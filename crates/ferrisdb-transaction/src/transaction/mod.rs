@@ -207,6 +207,8 @@ pub struct Transaction {
     buffer_pool: Option<Arc<BufferPool>>,
     /// WAL Writer 引用（用于写 commit/abort 记录）
     wal_writer: Option<Arc<WalWriter>>,
+    /// WAL Ring Buffer 引用（DML + commit 同路径保序）
+    wal_ring: Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>>,
     /// 事务超时（毫秒，0=无限制）
     timeout_ms: u64,
 }
@@ -221,6 +223,7 @@ impl Transaction {
             undo_log: Vec::new(),
             buffer_pool: None,
             wal_writer: None,
+            wal_ring: None,
             timeout_ms: 0,
         }
     }
@@ -232,6 +235,7 @@ impl Transaction {
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
         let wal_writer = manager.wal_writer.clone();
+        let wal_ring = manager.wal_ring.clone();
         let timeout_ms = manager.txn_timeout_ms;
         Self {
             info,
@@ -240,6 +244,7 @@ impl Transaction {
             undo_log: Vec::new(),
             buffer_pool: Some(buffer_pool),
             wal_writer,
+            wal_ring,
             timeout_ms,
         }
     }
@@ -308,11 +313,15 @@ impl Transaction {
         // 1. 先写 WAL commit record（确保持久化）
         // 2. 标记 active=false（防止 Drop 触发 abort）
         // 3. 设 CSN 和状态（使其对其他事务可见）
-        // Group commit: 写 WAL commit record 到 OS page cache，不等 fsync
-        // 后台 flusher 线程 5ms 批量 fsync（多 commit 共享一次 fsync）
-        if let Some(ref writer) = self.wal_writer {
-            let commit_rec = WalTxnCommit::new(self.info.xid, csn.raw());
-            writer.write(&commit_rec.to_bytes())?;
+        // WAL commit record 必须和 DML records 走同一路径（保序）
+        let commit_rec = WalTxnCommit::new(self.info.xid, csn.raw());
+        let commit_bytes = commit_rec.to_bytes();
+        if let Some(ref ring) = self.wal_ring {
+            // RingBuffer 路径：DML 和 commit 都在 ring 中，drain 线程按顺序写入 WalWriter
+            ring.write(&commit_bytes);
+        } else if let Some(ref writer) = self.wal_writer {
+            // 无 ring buffer：直接写 WalWriter
+            writer.write(&commit_bytes)?;
             writer.notify_sync();
         }
 
@@ -344,10 +353,15 @@ impl Transaction {
 
         self.info.set_state(TransactionState::Aborted);
 
-        // 写 WAL abort record
-        if let Some(ref writer) = self.wal_writer {
-            let abort_rec = WalTxnCommit::new_abort(self.info.xid);
-            let _ = writer.write(&abort_rec.to_bytes());
+        // 写 WAL abort record（必须传播错误，否则 recovery 无法识别 abort）
+        let abort_rec = WalTxnCommit::new_abort(self.info.xid);
+        let abort_bytes = abort_rec.to_bytes();
+        if let Some(ref ring) = self.wal_ring {
+            ring.write(&abort_bytes);
+        } else if let Some(ref writer) = self.wal_writer {
+            if let Err(e) = writer.write(&abort_bytes) {
+                eprintln!("[txn] WARN: abort WAL write failed for xid {:?}: {:?}", self.info.xid, e);
+            }
         }
 
         self.active = false;
@@ -597,6 +611,8 @@ pub struct TransactionManager {
     buffer_pool: Option<Arc<BufferPool>>,
     /// WAL Writer 引用（用于写 commit/abort 记录）
     wal_writer: Option<Arc<WalWriter>>,
+    /// WAL Ring Buffer 引用（DML + commit 同路径）
+    pub(crate) wal_ring: Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>>,
     /// 事务超时（毫秒，0=无限制）
     txn_timeout_ms: u64,
 }
@@ -619,8 +635,14 @@ impl TransactionManager {
             max_slots,
             buffer_pool: None,
             wal_writer: None,
+            wal_ring: None,
             txn_timeout_ms: 30_000, // 默认 30 秒
         }
+    }
+
+    /// 设置 WAL Ring Buffer
+    pub fn set_wal_ring(&mut self, ring: Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>) {
+        self.wal_ring = Some(ring);
     }
 
     /// 设置事务超时（毫秒，0=无限制）

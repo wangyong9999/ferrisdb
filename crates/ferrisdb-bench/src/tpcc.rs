@@ -1864,6 +1864,9 @@ fn main() {
     if let Some(ref w) = wal_writer {
         txn_manager_inner.set_wal_writer(Arc::clone(w));
         txn_manager_inner.set_buffer_pool(Arc::clone(&buffer_pool));
+        if let Some(ref ring) = wal_ring_ref {
+            txn_manager_inner.set_wal_ring(Arc::clone(ring));
+        }
     }
     let txn_manager = Arc::new(txn_manager_inner);
 

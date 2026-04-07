@@ -1876,9 +1876,27 @@ fn main() {
         }));
     }
 
+    // Progress reporter: 每 10 秒打印 TPS 快照
+    let stats_reporter = Arc::clone(&stats);
+    let report_secs = args.duration;
+    let report_handle = std::thread::spawn(move || {
+        let mut prev = 0u64;
+        let mut elapsed = 0u64;
+        while elapsed < report_secs {
+            std::thread::sleep(Duration::from_secs(10));
+            elapsed += 10;
+            let current = stats_reporter.total_committed();
+            let delta = current - prev;
+            let tps = delta / 10;
+            eprintln!("[{}s] interval TPS: {}, cumulative: {}", elapsed, tps, current / elapsed);
+            prev = current;
+        }
+    });
+
     for handle in handles {
         handle.join().unwrap();
     }
+    let _ = report_handle.join();
 
     let bench_elapsed = bench_start.elapsed();
     let run_time = bench_elapsed.as_secs();

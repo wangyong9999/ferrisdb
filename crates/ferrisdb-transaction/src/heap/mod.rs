@@ -106,6 +106,8 @@ pub struct HeapTable {
     fsm: Vec<std::sync::atomic::AtomicU8>,
     /// FSM 最大已分配页数
     fsm_max_page: std::sync::atomic::AtomicU32,
+    /// FSM 搜索起始 hint（roving pointer，上次成功位置）
+    fsm_search_hint: std::sync::atomic::AtomicU32,
 }
 
 impl HeapTable {
@@ -120,6 +122,7 @@ impl HeapTable {
             current_page: std::sync::atomic::AtomicU32::new(0),
             fsm: (0..65536).map(|_| std::sync::atomic::AtomicU8::new(255)).collect(),
             fsm_max_page: std::sync::atomic::AtomicU32::new(0),
+            fsm_search_hint: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -139,6 +142,7 @@ impl HeapTable {
             current_page: std::sync::atomic::AtomicU32::new(0),
             fsm: (0..65536).map(|_| std::sync::atomic::AtomicU8::new(255)).collect(),
             fsm_max_page: std::sync::atomic::AtomicU32::new(0),
+            fsm_search_hint: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -158,6 +162,7 @@ impl HeapTable {
             current_page: std::sync::atomic::AtomicU32::new(0),
             fsm: (0..65536).map(|_| std::sync::atomic::AtomicU8::new(255)).collect(),
             fsm_max_page: std::sync::atomic::AtomicU32::new(0),
+            fsm_search_hint: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -206,23 +211,24 @@ impl HeapTable {
         Ok(())
     }
 
-    /// FSM: 查找有足够空闲空间的页（无锁，roving pointer 避免线性扫描）
+    /// FSM: 查找有足够空闲空间的页（无锁，扫描已有页面 FSM）
     fn fsm_find_page(&self, needed: u16) -> Option<u32> {
         let threshold = if needed >= 8192 { 0 } else { 255 - (needed as u32 * 255 / 8192) as u8 };
         let max = self.fsm_max_page.load(std::sync::atomic::Ordering::Acquire) as usize;
         if max == 0 { return None; }
         let len = max.min(self.fsm.len());
-        // 从上次成功位置附近开始搜索（last_page - 1），最多搜索 8 页
-        let current = self.current_page.load(std::sync::atomic::Ordering::Acquire) as usize;
-        let start = if current > 0 { current - 1 } else { 0 };
-        let search_limit = 8.min(len);
+        // 从 FSM hint 开始搜索（上次成功位置），最多搜索 64 页或全部
+        let hint = self.fsm_search_hint.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let search_limit = len.min(64);
         for offset in 0..search_limit {
-            let i = (start + offset) % len;
+            let i = (hint + offset) % len;
             if self.fsm[i].load(std::sync::atomic::Ordering::Relaxed) >= threshold {
+                // 更新 hint 到下一个位置
+                self.fsm_search_hint.store(((i + 1) % len) as u32, std::sync::atomic::Ordering::Relaxed);
                 return Some(i as u32);
             }
         }
-        None // 8 页内没找到就放弃，走 allocate new page 路径
+        None
     }
 
     /// FSM: 更新页面空闲空间等级（无锁）
@@ -306,15 +312,7 @@ impl HeapTable {
 
                 if page.has_free_space(needed) {
                     if let Some(offset) = page.insert_tuple_from_parts(&header_bytes, data) {
-                        // WAL
-                        let mut tuple_buf = Vec::with_capacity(total_size);
-                        tuple_buf.extend_from_slice(&header_bytes);
-                        tuple_buf.extend_from_slice(data);
-                        let page_id = self.make_page_id(last_page);
-                        let wal_rec = WalHeapInsert::new(page_id, offset, &tuple_buf);
-                        self.wal_write(&wal_rec.serialize_with_data(&tuple_buf))?;
-
-                        // Undo: 记录插入，回滚时标记为 dead
+                        // Undo 优先于 WAL——确保即使 WAL 写入失败，abort 仍能清理
                         if let Some(txn) = txn {
                             txn.push_undo(UndoAction::Insert {
                                 table_oid: self.table_oid,
@@ -322,6 +320,13 @@ impl HeapTable {
                                 tuple_offset: offset,
                             })?;
                         }
+                        // WAL
+                        let mut tuple_buf = Vec::with_capacity(total_size);
+                        tuple_buf.extend_from_slice(&header_bytes);
+                        tuple_buf.extend_from_slice(data);
+                        let page_id = self.make_page_id(last_page);
+                        let wal_rec = WalHeapInsert::new(page_id, offset, &tuple_buf);
+                        self.wal_write(&wal_rec.serialize_with_data(&tuple_buf))?;
 
                         // 更新 FSM
                         let free = page.free_space();
@@ -351,15 +356,7 @@ impl HeapTable {
         let offset = page.insert_tuple_from_parts(&header_bytes, data)
             .ok_or_else(|| FerrisDBError::Internal("Failed to insert tuple in new page".to_string()))?;
 
-        // WAL
-        let mut tuple_buf = Vec::with_capacity(total_size);
-        tuple_buf.extend_from_slice(&header_bytes);
-        tuple_buf.extend_from_slice(data);
-        let page_id = self.make_page_id(new_page_no);
-        let wal_rec = WalHeapInsert::new(page_id, offset, &tuple_buf);
-        self.wal_write(&wal_rec.serialize_with_data(&tuple_buf))?;
-
-        // Undo
+        // Undo 优先于 WAL
         if let Some(txn) = txn {
             txn.push_undo(UndoAction::Insert {
                 table_oid: self.table_oid,
@@ -367,6 +364,13 @@ impl HeapTable {
                 tuple_offset: offset,
             })?;
         }
+        // WAL
+        let mut tuple_buf = Vec::with_capacity(total_size);
+        tuple_buf.extend_from_slice(&header_bytes);
+        tuple_buf.extend_from_slice(data);
+        let page_id = self.make_page_id(new_page_no);
+        let wal_rec = WalHeapInsert::new(page_id, offset, &tuple_buf);
+        self.wal_write(&wal_rec.serialize_with_data(&tuple_buf))?;
 
         drop(_lock);
         pinned.mark_dirty();
@@ -409,7 +413,7 @@ impl HeapTable {
             let page = unsafe { HeapPage::from_bytes(std::slice::from_raw_parts_mut(page_ptr, 8192)) };
 
             let old_data = page.get_tuple(tid.ip_posid)
-                .ok_or_else(|| FerrisDBError::Internal("Tuple not found".to_string()))?;
+                .ok_or_else(|| FerrisDBError::Internal(format!("Tuple not found: table={}, page={}, offset={}", self.table_oid, {tid.ip_blkid}, {tid.ip_posid})))?;
 
             let old_tuple_len = old_data.len();
             let new_tuple_len = TupleHeader::serialized_size() + new_data.len();
@@ -433,7 +437,7 @@ impl HeapTable {
                 old_header.cmax = cmax;
 
                 let old_data_mut = page.get_tuple_mut(tid.ip_posid)
-                    .ok_or_else(|| FerrisDBError::Internal("Tuple not found during update (concurrent vacuum?)".to_string()))?;
+                    .ok_or_else(|| FerrisDBError::Internal(format!("Tuple not found during update: table={}, page={}, offset={}", self.table_oid, {tid.ip_blkid}, {tid.ip_posid})))?;
                 old_data_mut[0..32].copy_from_slice(&old_header.serialize());
                 old_data_mut[32..].copy_from_slice(new_data);
 
@@ -480,7 +484,7 @@ impl HeapTable {
             let updated_old_header = old_header.serialize();
 
             let old_data_mut = page.get_tuple_mut(tid.ip_posid)
-                .ok_or_else(|| FerrisDBError::Internal("Tuple vanished during cross-page update".to_string()))?;
+                .ok_or_else(|| FerrisDBError::Internal(format!("Tuple vanished during cross-page update: table={}, page={}, offset={}", self.table_oid, {tid.ip_blkid}, {tid.ip_posid}).to_string()))?;
             old_data_mut[0..32].copy_from_slice(&updated_old_header);
 
             let new_header = TupleHeader::new(old_header_xmin, old_header_cmin);
@@ -499,7 +503,7 @@ impl HeapTable {
                 if let Some(offset) = page.insert_tuple(&tuple_data) {
                     // Set old tuple's ctid to point to new version (forward chain)
                     let old_data_mut2 = page.get_tuple_mut(tid.ip_posid)
-                        .ok_or_else(|| FerrisDBError::Internal("Tuple vanished during ctid update".to_string()))?;
+                        .ok_or_else(|| FerrisDBError::Internal(format!("Tuple vanished during ctid update: table={}, page={}, offset={}", self.table_oid, {tid.ip_blkid}, {tid.ip_posid}).to_string()))?;
                     let new_ctid = TupleId::new(tid.ip_blkid, offset);
                     old_data_mut2[24..28].copy_from_slice(&new_ctid.ip_blkid.to_le_bytes());
                     old_data_mut2[28..30].copy_from_slice(&new_ctid.ip_posid.to_le_bytes());
@@ -640,7 +644,7 @@ impl HeapTable {
         let page = unsafe { HeapPage::from_bytes(std::slice::from_raw_parts_mut(page_ptr, 8192)) };
 
         let old_data = page.get_tuple(tid.ip_posid)
-            .ok_or_else(|| FerrisDBError::Internal("Tuple not found".to_string()))?;
+            .ok_or_else(|| FerrisDBError::Internal(format!("Tuple not found: table={}, page={}, offset={}", self.table_oid, {tid.ip_blkid}, {tid.ip_posid})))?;
 
         // Save old data for undo before modification
         let old_data_for_undo: Option<Vec<u8>> = if txn.is_some() {
@@ -657,7 +661,7 @@ impl HeapTable {
         let updated_header = header.serialize();
 
         let old_data_mut = page.get_tuple_mut(tid.ip_posid)
-            .ok_or_else(|| FerrisDBError::Internal("Tuple not found during delete".to_string()))?;
+            .ok_or_else(|| FerrisDBError::Internal(format!("Tuple not found during delete: table={}, page={}, offset={}", self.table_oid, {tid.ip_blkid}, {tid.ip_posid}).to_string()))?;
         old_data_mut[0..32].copy_from_slice(&updated_header);
 
         // WAL

@@ -605,7 +605,7 @@ impl BTree {
     }
 
     /// 写入 BTree WAL 记录（逻辑日志: page_id + key + value）
-    fn wal_write_insert(&self, page_no: u32, item: &BTreeItem) {
+    fn wal_write_insert(&self, page_no: u32, item: &BTreeItem) -> ferrisdb_core::Result<()> {
         if let Some(ref writer) = self.wal_writer {
             let page_id = self.make_page_id(page_no);
             let item_bytes = item.serialize();
@@ -623,15 +623,13 @@ impl BTree {
             let mut buf = Vec::with_capacity(page_rec_bytes.len() + item_bytes.len());
             buf.extend_from_slice(page_rec_bytes);
             buf.extend_from_slice(&item_bytes);
-            if let Err(_e) = writer.write(&buf) {
-                // BTree WAL 写入失败：数据仍在 buffer pool，但 crash 后此 insert 丢失
-                // 生产环境应上报告警
-            }
+            writer.write(&buf)?;
         }
+        Ok(())
     }
 
     /// 写入 BTree split WAL 记录
-    fn wal_write_split(&self, left_page: u32, right_page: u32, separator: &BTreeKey) {
+    fn wal_write_split(&self, left_page: u32, right_page: u32, separator: &BTreeKey) -> ferrisdb_core::Result<()> {
         if let Some(ref writer) = self.wal_writer {
             let page_id = self.make_page_id(left_page);
             let payload_len = 4 + 2 + separator.data.len();
@@ -651,10 +649,9 @@ impl BTree {
             buf.extend_from_slice(&right_page.to_le_bytes());
             buf.extend_from_slice(&(separator.data.len() as u16).to_le_bytes());
             buf.extend_from_slice(&separator.data);
-            if let Err(_e) = writer.write(&buf) {
-                // BTree WAL split 写入失败
-            }
+            writer.write(&buf)?;
         }
+        Ok(())
     }
 
     /// 初始化 B-Tree（创建根页面）
@@ -765,7 +762,7 @@ impl BTree {
                 page.insert_item_sorted(item);
                 drop(lock);
                 pinned.mark_dirty();
-                self.wal_write_insert(page_no, item);
+                self.wal_write_insert(page_no, item)?;
                 return Ok(None);
             }
             // 叶子满了 — split_mutex 已由 caller 持有，直接持锁 split
@@ -798,7 +795,7 @@ impl BTree {
                 right_pinned.mark_dirty();
             }
 
-            self.wal_write_split(page_no, right_page_no, &separator);
+            self.wal_write_split(page_no, right_page_no, &separator)?;
             self.stats.splits.fetch_add(1, Ordering::Relaxed);
 
             return Ok(Some(SplitResult { right_page: right_page_no, separator }));
@@ -840,7 +837,7 @@ impl BTree {
             page.insert_item_sorted(&sep_item);
             drop(lock);
             pinned.mark_dirty();
-            self.wal_write_insert(page_no, &sep_item);
+            self.wal_write_insert(page_no, &sep_item)?;
             return Ok(None);
         }
 
@@ -872,7 +869,7 @@ impl BTree {
             right_pinned.mark_dirty();
         }
 
-        self.wal_write_split(page_no, right_page_no, &separator);
+        self.wal_write_split(page_no, right_page_no, &separator)?;
         Ok(Some(SplitResult { right_page: right_page_no, separator }))
     }
 
@@ -1001,7 +998,7 @@ impl BTree {
             pinned.mark_dirty();
         }
 
-        self.wal_write_split(page_no, right_page_no, &separator);
+        self.wal_write_split(page_no, right_page_no, &separator)?;
         Ok(SplitResult { separator, right_page: right_page_no })
     }
 

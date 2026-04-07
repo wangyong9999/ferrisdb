@@ -126,6 +126,8 @@ pub struct CheckpointManager {
     config: CheckpointConfig,
     /// WAL Writer
     wal_writer: Arc<WalWriter>,
+    /// WAL RingBuffer（checkpoint 前等待 drain 完成）
+    wal_ring: Option<Arc<super::ring_buffer::WalRingBuffer>>,
     /// 脏页刷盘器
     flusher: Option<Arc<dyn DirtyPageFlusher>>,
     /// 事务收集器
@@ -150,6 +152,7 @@ impl CheckpointManager {
         Self {
             config,
             wal_writer,
+            wal_ring: None,
             flusher: None,
             txn_collector: None,
             state: AtomicU32::new(CheckpointState::Idle as u32),
@@ -169,6 +172,12 @@ impl CheckpointManager {
             self.last_checkpoint_lsn.store(saved_lsn.raw(), Ordering::Release);
         }
         self.control_file = Some(cf);
+    }
+
+    /// 设置脏页刷盘器
+    /// 设置 WAL RingBuffer（checkpoint 前等待其 drain）
+    pub fn set_wal_ring(&mut self, ring: Arc<super::ring_buffer::WalRingBuffer>) {
+        self.wal_ring = Some(ring);
     }
 
     /// 设置脏页刷盘器
@@ -270,7 +279,16 @@ impl CheckpointManager {
             Vec::new()
         };
 
-        // 3. 先刷盘脏页（确保数据页安全落盘后再写 checkpoint 记录）
+        // 3. 等待 RingBuffer drain 完成（确保所有 DML WAL 记录已写入 WalWriter）
+        if let Some(ref ring) = self.wal_ring {
+            let mut waits = 0;
+            while ring.unflushed() > 0 && waits < 100 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                waits += 1;
+            }
+        }
+
+        // 4. 刷盘脏页（确保数据页安全落盘后再写 checkpoint 记录）
         if let Some(ref flusher) = self.flusher {
             let pages_flushed = flusher.flush_dirty_pages(checkpoint_lsn)?;
             stats.pages_flushed = pages_flushed;

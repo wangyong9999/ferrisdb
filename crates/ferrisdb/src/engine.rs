@@ -102,6 +102,10 @@ pub struct Engine {
     checkpoint_manager: Option<Arc<CheckpointManager>>,
     /// Checkpoint 后台线程
     _checkpoint_handle: Option<JoinHandle<()>>,
+    /// WAL RingBuffer（DML 无锁写入）
+    wal_ring: Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>>,
+    /// WAL drain 线程
+    _wal_drain_handle: Option<JoinHandle<()>>,
     /// AutoVacuum 后台线程
     _autovacuum_handle: Option<JoinHandle<()>>,
     /// AutoVacuum 停止信号
@@ -161,6 +165,17 @@ impl Engine {
         };
         let bp = Arc::new(bp);
 
+        // 4b. WAL RingBuffer + drain 线程
+        let (wal_ring, wal_drain_handle) = if let Some(ref w) = wal_writer {
+            let ring = Arc::new(ferrisdb_storage::wal::ring_buffer::WalRingBuffer::new(16 * 1024 * 1024));
+            let handle = ferrisdb_storage::wal::ring_buffer::start_drain_thread(
+                Arc::clone(&ring), Arc::clone(w), 5,
+            );
+            (Some(ring), Some(handle))
+        } else {
+            (None, None)
+        };
+
         // 5. 事务管理器
         let mut tm = ferrisdb_transaction::TransactionManager::new(
             ferrisdb_core::config::config().max_connections.load(std::sync::atomic::Ordering::Acquire) as usize,
@@ -168,6 +183,9 @@ impl Engine {
         tm.set_buffer_pool(Arc::clone(&bp));
         if let Some(ref w) = wal_writer {
             tm.set_wal_writer(Arc::clone(w));
+        }
+        if let Some(ref ring) = wal_ring {
+            tm.set_wal_ring(Arc::clone(ring));
         }
         let tm = Arc::new(tm);
 
@@ -203,6 +221,9 @@ impl Engine {
             );
             cm.set_flusher(Arc::clone(&bp) as Arc<dyn ferrisdb_storage::wal::DirtyPageFlusher>);
             cm.set_control_file(Arc::clone(&control_file));
+            if let Some(ref ring) = wal_ring {
+                cm.set_wal_ring(Arc::clone(ring));
+            }
             let cm = Arc::new(cm);
             let handle = Arc::clone(&cm).start_auto_checkpoint();
             (Some(cm), Some(handle))
@@ -246,6 +267,7 @@ impl Engine {
             catalog, control_file,
             _bgwriter: bgwriter, _wal_flusher: wal_flusher,
             checkpoint_manager, _checkpoint_handle: checkpoint_handle,
+            wal_ring: wal_ring.clone(), _wal_drain_handle: wal_drain_handle,
             _autovacuum_handle: autovacuum_handle,
             autovacuum_shutdown,
             registered_tables,
@@ -264,12 +286,19 @@ impl Engine {
         if remaining > 0 {
             eprintln!("Warning: {} active transactions still running at shutdown", remaining);
         }
-        // 3. 停止后台线程
+        // 3. 停止 RingBuffer drain 线程（确保所有 WAL 数据落盘）
+        if let Some(ref ring) = self.wal_ring {
+            ring.shutdown(); // 信号 drain 线程退出（退出前会 final flush）
+        }
+        // 等待 drain 线程完成 final flush（最多 2 秒）
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // 4. 停止其他后台线程
         self.autovacuum_shutdown.store(true, std::sync::atomic::Ordering::Release);
         if let Some(ref cm) = self.checkpoint_manager {
             cm.stop();
         }
-        // 3. 执行关闭 checkpoint（flush all dirty + write checkpoint record）
+        // 5. 执行关闭 checkpoint（flush all dirty + write checkpoint record）
         if let Some(ref cm) = self.checkpoint_manager {
             let _ = cm.checkpoint(CheckpointType::Shutdown);
         } else {

@@ -4,7 +4,7 @@
 
 use ferrisdb_core::{BufferTag, FerrisDBError, PdbId, Snapshot, Xid};
 use ferrisdb_storage::{BufferPool, HeapPage, ItemPointerData, ItemIdFlags};
-use ferrisdb_storage::wal::{WalBuffer, WalWriter, WalHeapInsert, WalHeapDelete, WalHeapInplaceUpdate, WalHeapUpdateNewPage, WalHeapUpdateOldPage};
+use ferrisdb_storage::wal::{WalBuffer, WalWriter, WalHeapInsert, WalHeapDelete, WalHeapInplaceUpdate, WalHeapUpdateNewPage, WalHeapUpdateOldPage, WalRecordForPage, WalRecordType};
 use std::sync::Arc;
 
 use crate::transaction::{Transaction, TransactionManager, UndoAction};
@@ -913,13 +913,22 @@ impl HeapTable {
         }
 
         if any_dead {
-            let reclaimed = page.compact_dead();
+            let _reclaimed = page.compact_dead();
             let free = page.free_space();
+            // Vacuum WAL record（crash 后 recovery 重做 compact）
+            let page_id = self.make_page_id(page_no);
+            let wal_rec = WalRecordForPage::new(WalRecordType::HeapPrune, page_id, 0);
+            let wal_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &wal_rec as *const WalRecordForPage as *const u8,
+                    std::mem::size_of::<WalRecordForPage>(),
+                )
+            };
+            let _ = self.wal_write(wal_bytes);
             drop(_lock);
             pinned.mark_dirty();
-            // 更新 FSM（让后续 insert 重用这个页面的空间）
             self.fsm_update(page_no, free);
-            reclaimed
+            _reclaimed
         } else {
             0
         }

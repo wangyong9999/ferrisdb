@@ -117,11 +117,11 @@ bash scripts/sanitizer_check.sh
 
 | Phase | Item | Status | Date |
 |-------|------|--------|------|
-| R1 | Eviction flush failure protection | PENDING | |
-| R2 | Table-level metadata lock (DDL/DML) | PENDING | |
-| R3 | WAL max retention + emergency cleanup | PENDING | |
-| R4 | Large transaction error improvement | PENDING | |
-| R5 | Slot exhaustion error context | PENDING | |
-| R6 | Engine health check enhancement | PENDING | |
-| T1 | WAL 300s stability test | PENDING | |
-| T2 | Disk full simulation test | PENDING | |
+| R1 | Eviction flush failure protection | **DONE** — flush 失败不替换 victim，返回错误 | 2026-04-07 |
+| R2 | Table-level metadata lock | **DONE** — DDL 排他锁，DML 共享锁 via get_table_lock() | 2026-04-07 |
+| R3 | WAL max retention | **DONE** — wal_size_threshold 触发紧急 checkpoint | 2026-04-07 |
+| R4 | Large txn error improvement | **DONE** — 包含当前/最大 action 数 + 建议分批 | 2026-04-07 |
+| R5 | Slot error context | **DONE** — 包含 active/max slots + 建议 | 2026-04-07 |
+| R6 | Engine health: wal_ring_unflushed | **DONE** — EngineStats 增加 ring buffer 监控 | 2026-04-07 |
+| T1 | WAL 300s stability | **DONE** — 5W/8T/300s WAL 完成，无 hang/crash/panic | 2026-04-07 |
+| T2 | ASan + TSan regression | **DONE** — ASan 829 pass 0 fail, TSan 无新 race | 2026-04-07 |

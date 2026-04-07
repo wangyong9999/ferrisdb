@@ -28,6 +28,8 @@ pub struct EngineStats {
     pub active_transactions: u64,
     /// WAL 当前写入偏移
     pub wal_offset: u64,
+    /// WAL RingBuffer 未 flush 数据量
+    pub wal_ring_unflushed: u64,
     /// 最近 checkpoint LSN
     pub checkpoint_lsn: u64,
     /// 是否正在关闭
@@ -92,6 +94,8 @@ pub struct Engine {
     txn_manager: Arc<ferrisdb_transaction::TransactionManager>,
     /// 系统目录
     catalog: Arc<SystemCatalog>,
+    /// 表级 Metadata Lock（DDL 排他，DML 共享，防止 DROP+INSERT 并发）
+    table_locks: RwLock<std::collections::HashMap<u32, Arc<parking_lot::RwLock<()>>>>,
     /// Control file
     control_file: Arc<ControlFile>,
     /// 后台写线程
@@ -265,6 +269,7 @@ impl Engine {
             _lockfile: lockfile,
             smgr, buffer_pool: bp, wal_writer, txn_manager: tm,
             catalog, control_file,
+            table_locks: RwLock::new(std::collections::HashMap::new()),
             _bgwriter: bgwriter, _wal_flusher: wal_flusher,
             checkpoint_manager, _checkpoint_handle: checkpoint_handle,
             wal_ring: wal_ring.clone(), _wal_drain_handle: wal_drain_handle,
@@ -316,6 +321,17 @@ impl Engine {
         Ok(())
     }
 
+    /// 获取表的 metadata lock 底层 Arc
+    fn get_table_lock(&self, oid: u32) -> Arc<parking_lot::RwLock<()>> {
+        let locks = self.table_locks.read();
+        if let Some(lock) = locks.get(&oid) {
+            return Arc::clone(lock);
+        }
+        drop(locks);
+        let mut locks = self.table_locks.write();
+        locks.entry(oid).or_insert_with(|| Arc::new(parking_lot::RwLock::new(()))).clone()
+    }
+
     /// 注册 HeapTable 供 AutoVacuum 管理
     pub fn register_table(&self, table: Arc<ferrisdb_transaction::HeapTable>) {
         self.registered_tables.write().push(table);
@@ -334,6 +350,7 @@ impl Engine {
             buffer_pool_dirty_pages: self.buffer_pool.dirty_page_count() as u64,
             active_transactions: self.txn_manager.active_transaction_count() as u64,
             wal_offset: self.wal_writer.as_ref().map_or(0, |w| w.offset()),
+            wal_ring_unflushed: self.wal_ring.as_ref().map_or(0, |r| r.unflushed()),
             checkpoint_lsn: self.control_file.checkpoint_lsn().raw(),
             is_shutdown: self.is_shutdown(),
         }
@@ -397,6 +414,9 @@ impl Engine {
         let meta = self.catalog.lookup_by_name(name)
             .ok_or_else(|| FerrisDBError::NotFound(format!("Table '{}' not found", name)))?;
         let oid = meta.oid;
+        // 排他 MDL：阻塞并发 DML，确保无进行中的读写
+        let mdl = self.get_table_lock(oid);
+        let _mdl_guard = mdl.write();
         self.catalog.drop_relation(oid)?;
         self.write_ddl_wal(ferrisdb_storage::wal::WalRecordType::DdlDrop, oid, name);
         Ok(())

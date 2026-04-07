@@ -350,8 +350,12 @@ impl CheckpointManager {
             return true;
         }
 
-        // 检查 WAL 大小
-        // 简化实现：暂不检查
+        // 检查 WAL 大小（防止 WAL 文件无限积累）
+        let wal_offset = self.wal_writer.offset();
+        let last_ckpt = self.last_checkpoint_lsn.load(Ordering::Acquire);
+        if wal_offset.saturating_sub(last_ckpt) > self.config.wal_size_threshold {
+            return true;
+        }
 
         // 检查脏页比例
         if let Some(ref flusher) = self.flusher {

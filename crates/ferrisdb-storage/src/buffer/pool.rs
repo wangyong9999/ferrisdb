@@ -244,19 +244,22 @@ impl BufferPool {
             self.table.remove(&old_tag);
         }
 
-        // 释放 alloc_lock 后再做脏页刷写（I/O 不在锁内）
-        let need_flush = desc.is_dirty();
-        // 先插入新 tag 到 hash 表（占位），再释放锁
+        // 脏页必须先 flush 成功才能替换（防止数据丢失）
+        if desc.is_dirty() {
+            // 在 alloc_lock 内 flush（确保 flush 失败时不丢页面）
+            if let Err(e) = self.flush_buffer(buf_id) {
+                // flush 失败：放弃这个 victim，释放锁，返回错误
+                self.alloc_lock.store(0, Ordering::Release);
+                return Err(FerrisDBError::Internal(format!(
+                    "Buffer eviction failed: cannot flush dirty page: {:?}", e
+                )));
+            }
+        }
+
+        // flush 成功（或不需要 flush），安全替换 tag
         self.table.insert(*tag, buf_id);
         desc.pin();
         self.alloc_lock.store(0, Ordering::Release);
-
-        // 在锁外执行 I/O
-        if need_flush {
-            if let Err(e) = self.flush_buffer(buf_id) {
-                eprintln!("[buffer] eviction flush failed for buf_id {}: {:?}", buf_id, e);
-            }
-        }
 
         // 读取新页面（alloc_lock 已释放，I/O 不阻塞其他线程）
         let page_data = desc.buf_block.load(Ordering::Acquire);

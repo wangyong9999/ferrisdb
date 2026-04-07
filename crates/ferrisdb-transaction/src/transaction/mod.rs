@@ -387,7 +387,7 @@ impl Transaction {
         const MAX_UNDO_ACTIONS: usize = 1_000_000;
         if self.undo_log.len() >= MAX_UNDO_ACTIONS {
             return Err(FerrisDBError::Transaction(TransactionError::InvalidState(
-                format!("Transaction too large: undo_log exceeds {} actions", MAX_UNDO_ACTIONS)
+                format!("Transaction too large: undo_log has {} actions (limit {}). Consider committing in smaller batches.", self.undo_log.len(), MAX_UNDO_ACTIONS)
             )));
         }
         if let Some(ref writer) = self.wal_writer {
@@ -685,7 +685,12 @@ impl TransactionManager {
                     slot_idx = Some(i);
                 }
             }
-            let idx = slot_idx.ok_or(ferrisdb_core::error::TransactionError::NoFreeSlot)?;
+            let idx = slot_idx.ok_or_else(|| {
+                let active = slots.iter().filter(|s| s.is_some()).count();
+                FerrisDBError::Transaction(TransactionError::InvalidState(
+                    format!("No free transaction slot: {}/{} slots in use. Increase max_connections or close idle transactions.", active, self.max_slots)
+                ))
+            })?;
 
             let snapshot_csn = self.csn_allocator.current();
             let snapshot = Snapshot::new(snapshot_csn, active_xids);

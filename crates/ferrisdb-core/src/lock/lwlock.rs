@@ -167,94 +167,42 @@ impl LWLock {
     /// 2. 检查是否有排他锁或 DISALLOW_PREEMPT
     /// 3. 如果有，则 CAS 回滚（恢复计数）
     /// 4. 如果没有，设置 SHARED 标志（如果是第一个共享锁）
+    /// 获取共享锁
+    ///
+    /// 纯 CAS 循环——不使用 fetch_add + rollback 模式。
+    /// 原因同 ContentLock：fetch_add/sub 对会在中间态暴露虚假 count，
+    /// 被并发 CAS 观察后导致状态字损坏。
     pub fn acquire_shared(&self) {
-        // Phase 1: 无条件 +1
-        let old_state = self.state.fetch_add(1, Ordering::AcqRel);
-
-        // 检查是否可以成功获取
-        // 条件：没有排他锁，没有 DISALLOW_PREEMPT
-        if !has_exclusive(old_state) && !is_disallow_preempt(old_state) {
-            // 成功！需要确保 SHARED 标志已设置
-            if !has_shared(old_state) {
-                // 第一个共享锁，设置 SHARED 标志
-                self.try_set_shared_flag();
-            }
-            fence(Ordering::Acquire);
-            return;
-        }
-
-        // Phase 2: 需要 CAS 回滚
-        self.acquire_shared_slow(old_state);
-    }
-
-    /// 慢速路径：CAS 回滚或等待
-    fn acquire_shared_slow(&self, _old_state: u64) {
         let mut spins = self.spins_per_delay.load(Ordering::Relaxed);
-        let mut need_rollback = true;
 
         loop {
-            if need_rollback {
-                // 先回滚 +1（fetch_sub 返回旧值）
-                let old = self.state.fetch_sub(1, Ordering::AcqRel);
-                let new_state = old - 1;
-                need_rollback = false;
-
-                // 检查回滚后是否还有其他共享锁
-                let count = get_share_count(new_state);
-                if count == 0 && has_shared(new_state) {
-                    // 需要清除 SHARED 标志
-                    self.try_clear_shared_flag(new_state);
-                }
-            }
-
-            // 重新尝试获取
             let current = self.state.load(Ordering::Acquire);
 
-            // 检查是否可以获取
             if !has_exclusive(current) && !is_disallow_preempt(current) {
-                // 尝试 CAS 设置 SHARED 和计数
-                let desired = if has_shared(current) {
-                    current + 1 // 已有 SHARED，只增加计数
-                } else {
-                    (current & !SHARE_COUNT_MASK) | SHARED | 1 // 第一个共享锁
-                };
-
-                match self.state.compare_exchange_weak(
-                    current,
-                    desired,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        fence(Ordering::Acquire);
-                        return;
-                    }
-                    Err(_) => {
-                        // CAS 失败，重试
-                        continue;
-                    }
+                let new_count = get_share_count(current) + 1;
+                let desired = (current & !SHARE_COUNT_MASK) | SHARED | (new_count as u64);
+                if self.state.compare_exchange_weak(
+                    current, desired, Ordering::AcqRel, Ordering::Relaxed,
+                ).is_ok() {
+                    return;
                 }
+                continue;
             }
 
-            // 需要等待
+            // 需要等待——使用 FIFO park 队列
             if has_waiters(current) {
-                // 已有等待者，加入等待队列
                 self.wait_shared();
                 return;
             }
 
-            // 尝试设置 HAS_WAITERS 并等待
             let with_waiters = current | HAS_WAITERS;
-            if self
-                .state
-                .compare_exchange_weak(current, with_waiters, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
+            if self.state.compare_exchange_weak(
+                current, with_waiters, Ordering::AcqRel, Ordering::Relaxed,
+            ).is_ok() {
                 self.wait_shared();
                 return;
             }
 
-            // 自旋
             spins = self.spin_delay(spins);
         }
     }
@@ -385,20 +333,29 @@ impl LWLock {
     // ========== 锁释放 ==========
 
     /// 释放共享锁
+    /// 释放共享锁（纯 CAS，与 acquire_shared 对称）
     pub fn release_shared(&self) {
-        // fetch_sub 返回的是旧值，不是新值
-        let old_state = self.state.fetch_sub(1, Ordering::AcqRel);
-        let new_state = old_state - 1;
+        loop {
+            let old_state = self.state.load(Ordering::Acquire);
+            let count = get_share_count(old_state);
+            debug_assert!(count > 0, "release_shared with count=0");
+            if count == 0 { return; }
 
-        // 检查是否需要清除 SHARED 标志
-        let count = get_share_count(new_state);
-        if count == 0 && has_shared(new_state) {
-            self.try_clear_shared_flag(new_state);
-        }
+            let new_count = count - 1;
+            let mut new_state = (old_state & !SHARE_COUNT_MASK) | (new_count as u64);
+            if new_count == 0 {
+                new_state &= !SHARED;
+            }
 
-        // 检查是否需要唤醒等待者
-        if has_waiters(old_state) && !is_locked(new_state) {
-            self.wakeup_waiters();
+            if self.state.compare_exchange_weak(
+                old_state, new_state, Ordering::AcqRel, Ordering::Relaxed,
+            ).is_ok() {
+                // 最后一个 reader 释放且有等待者 → 唤醒
+                if new_count == 0 && has_waiters(old_state) {
+                    self.wakeup_waiters();
+                }
+                return;
+            }
         }
     }
 

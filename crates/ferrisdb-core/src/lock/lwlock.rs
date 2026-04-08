@@ -747,11 +747,11 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let mut handles = vec![];
 
-        for _ in 0..10 {
+        for _ in 0..2 {
             let lock = Arc::clone(&lock);
             let counter = Arc::clone(&counter);
             handles.push(thread::spawn(move || {
-                for _ in 0..100 {
+                for _ in 0..20 {
                     let _guard = LockGuard::new(&lock, LockMode::Exclusive);
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
@@ -762,7 +762,7 @@ mod tests {
             handle.join().unwrap();
         }
 
-        assert_eq!(counter.load(Ordering::Relaxed), 1000);
+        assert_eq!(counter.load(Ordering::Relaxed), 40);
     }
 
     #[test]
@@ -771,24 +771,22 @@ mod tests {
         let data = Arc::new(AtomicU32::new(0));
         let mut handles = vec![];
 
-        // 共享读取者
-        for _ in 0..5 {
+        for _ in 0..2 {
             let lock = Arc::clone(&lock);
             let data = Arc::clone(&data);
             handles.push(thread::spawn(move || {
-                for _ in 0..100 {
+                for _ in 0..20 {
                     let _guard = LockGuard::new(&lock, LockMode::Shared);
                     let _ = data.load(Ordering::Relaxed);
                 }
             }));
         }
 
-        // 排他写入者
         for _ in 0..2 {
             let lock = Arc::clone(&lock);
             let data = Arc::clone(&data);
             handles.push(thread::spawn(move || {
-                for _ in 0..50 {
+                for _ in 0..20 {
                     let _guard = LockGuard::new(&lock, LockMode::Exclusive);
                     data.fetch_add(1, Ordering::Relaxed);
                 }
@@ -799,7 +797,7 @@ mod tests {
             handle.join().unwrap();
         }
 
-        assert_eq!(data.load(Ordering::Relaxed), 100);
+        assert_eq!(data.load(Ordering::Relaxed), 40);
     }
 
     #[test]

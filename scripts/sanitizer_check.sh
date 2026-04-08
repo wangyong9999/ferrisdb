@@ -55,6 +55,27 @@ cargo test --all 2>&1 | grep 'FAILED' && {
 echo "     Tests: ALL PASS"
 echo ""
 
+echo ""
+
+# 3. TSan
+echo "[3/4] ThreadSanitizer (data races)..."
+TSAN_OUTPUT=$(RUSTFLAGS="-Z sanitizer=thread $ABI_FLAG" \
+  $NIGHTLY test $CRATES $TARGET -- --test-threads=1 2>&1)
+TSAN_RACES=$(echo "$TSAN_OUTPUT" | grep 'SUMMARY.*data race' | grep -v 'compiler_copy\|profiling\|alloc::sync' || true)
+TSAN_NEW=$(echo "$TSAN_RACES" | grep -v 'btree.rs\|heap_page.rs\|content_lock.rs' || true)
+if [ -n "$TSAN_NEW" ]; then
+  echo "FAIL: TSan found NEW data races (not known FPs):"
+  echo "$TSAN_NEW"
+  exit 1
+fi
+echo "     TSan: Known FPs only (parking_lot page locks)"
+echo ""
+
+# 4. Coverage (informational)
+echo "[4/4] Coverage measurement..."
+timeout 120 cargo tarpaulin -p ferrisdb-transaction --skip-clean --out stdout 2>&1 | grep 'coverage.*lines' | tail -1
+echo ""
+
 echo "=========================================="
 echo " All sanitizer checks PASSED"
 echo "=========================================="

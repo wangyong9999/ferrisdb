@@ -52,50 +52,39 @@ impl ContentLock {
     // ========== 共享锁 ==========
 
     /// 获取共享锁
+    ///
+    /// 使用纯 CAS 循环（无 fetch_add + rollback 模式）。
+    ///
+    /// 之前的 fetch_add(1) + 发现冲突后 fetch_sub(1) 回滚模式存在竞态：
+    /// 在 fetch_add 和 fetch_sub 之间，其他线程的 CAS 可能看到一个
+    /// 临时的错误 share count，导致状态字损坏（count 下溢）。
+    ///
+    /// CAS 循环虽然在无竞争时略慢（多一次 load），但完全避免了
+    /// 对状态字的非原子修改，确保并发安全。
     pub fn acquire_shared(&self) {
-        let old_state = self.state.fetch_add(1, Ordering::AcqRel);
-        if !has_exclusive(old_state) && !is_disallow_preempt(old_state) {
-            if !has_shared(old_state) {
-                self.try_set_shared_flag();
-            }
-            return; // fetch_add with AcqRel already provides acquire semantics
-        }
-        self.acquire_shared_slow();
-    }
-
-    fn acquire_shared_slow(&self) {
-        // 回滚先前的 +1
-        let old = self.state.fetch_sub(1, Ordering::AcqRel);
-        let after_rollback = old - 1;
-        if get_share_count(after_rollback) == 0 && has_shared(after_rollback) {
-            self.try_clear_shared_flag(after_rollback);
-        }
-
         let mut spins: u32 = 0;
+
         loop {
             let current = self.state.load(Ordering::Acquire);
+
+            // 检查是否可获取共享锁
             if !has_exclusive(current) && !is_disallow_preempt(current) {
-                let desired = if has_shared(current) {
-                    current + 1
-                } else {
-                    (current & !SHARE_COUNT_MASK) | SHARED | 1
-                };
+                // 构造新状态: count + 1, 确保 SHARED flag
+                let new_count = get_share_count(current) + 1;
+                let desired = (current & !SHARE_COUNT_MASK) | SHARED | (new_count as u64);
                 match self.state.compare_exchange_weak(
                     current, desired, Ordering::AcqRel, Ordering::Relaxed,
                 ) {
-                    Ok(_) => {
-                        std::sync::atomic::fence(Ordering::Acquire);
-                        return;
-                    }
-                    Err(_) => continue,
+                    Ok(_) => return,
+                    Err(_) => continue, // 被并发修改，重试
                 }
             }
 
+            // 有排他锁或 DISALLOW_PREEMPT — 等待
             spins += 1;
             if spins < SPIN_LIMIT {
                 std::hint::spin_loop();
             } else {
-                // 使用 park_timeout 带指数退避
                 let key = self.park_key();
                 unsafe {
                     parking_lot_core::park(
@@ -107,7 +96,7 @@ impl ContentLock {
                         || {},
                         |_, _| {},
                         parking_lot_core::DEFAULT_PARK_TOKEN,
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(1)),
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(2)),
                     );
                 }
                 spins = 0;
@@ -153,26 +142,18 @@ impl ContentLock {
     }
 
     fn acquire_exclusive_slow(&self) {
-        // 设置 DISALLOW_PREEMPT — 新的 acquire_shared 会看到并回退
+        // 设置 DISALLOW_PREEMPT — 新的 acquire_shared CAS 会看到此标志
+        // 并在 CAS 条件中失败（不会 fetch_add 污染 count）
         let _ = self.state.fetch_or(DISALLOW_PREEMPT, Ordering::AcqRel);
 
         let mut spins: u32 = 0;
         loop {
             let old_state = self.state.load(Ordering::Acquire);
-            // can_acquire 检查无 SHARED/EXCLUSIVE，但我们已设置 DISALLOW_PREEMPT
-            // 只需检查无其他锁持有者
-            if !has_exclusive(old_state) && !has_shared(old_state) {
-                // 清除 DISALLOW_PREEMPT 并设置 EXCLUSIVE
-                let new_state = (old_state & !DISALLOW_PREEMPT) | EXCLUSIVE;
-                if self.state.compare_exchange_weak(
-                    old_state, new_state, Ordering::AcqRel, Ordering::Relaxed,
-                ).is_ok() {
-                    return;
-                }
-                continue;
-            }
-            // 只剩 shared 持有者时（无 exclusive），等 share count 降到 0
+
+            // 可获取条件：无 EXCLUSIVE 且 share count == 0
+            // （SHARED flag 可能残留但 count==0 说明没有持有者）
             if !has_exclusive(old_state) && get_share_count(old_state) == 0 {
+                // 清除 DISALLOW_PREEMPT + SHARED flag，设置 EXCLUSIVE
                 let new_state = (old_state & !DISALLOW_PREEMPT & !SHARED) | EXCLUSIVE;
                 if self.state.compare_exchange_weak(
                     old_state, new_state, Ordering::AcqRel, Ordering::Relaxed,
@@ -205,16 +186,30 @@ impl ContentLock {
     // ========== 释放 ==========
 
     /// 释放共享锁
+    ///
+    /// CAS 循环确保 count 不会下溢：只有 count > 0 时才减 1。
     pub fn release_shared(&self) {
-        let old_state = self.state.fetch_sub(1, Ordering::AcqRel);
-        let new_state = old_state - 1;
-        let count = get_share_count(new_state);
-        if count == 0 && has_shared(new_state) {
-            self.try_clear_shared_flag(new_state);
-        }
-        // 最后一个共享锁释放时唤醒排他锁等待者
-        if count == 0 {
-            self.unpark_one();
+        loop {
+            let old_state = self.state.load(Ordering::Acquire);
+            let count = get_share_count(old_state);
+            debug_assert!(count > 0, "release_shared with count=0");
+            if count == 0 { return; } // 安全兜底
+
+            let new_count = count - 1;
+            let mut new_state = (old_state & !SHARE_COUNT_MASK) | (new_count as u64);
+            // 最后一个 reader 释放时清除 SHARED flag
+            if new_count == 0 {
+                new_state &= !SHARED;
+            }
+
+            if self.state.compare_exchange_weak(
+                old_state, new_state, Ordering::AcqRel, Ordering::Relaxed,
+            ).is_ok() {
+                if new_count == 0 {
+                    self.unpark_one();
+                }
+                return;
+            }
         }
     }
 

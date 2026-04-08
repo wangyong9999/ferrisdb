@@ -73,7 +73,7 @@ echo ""
 
 # 4. Coverage (informational)
 echo "[4/4] Coverage measurement..."
-timeout 120 cargo tarpaulin -p ferrisdb-transaction --skip-clean --out stdout 2>&1 | grep 'coverage.*lines' | tail -1
+timeout 120 cargo llvm-cov report --summary-only 2>&1 | grep TOTAL
 echo ""
 
 echo "=========================================="

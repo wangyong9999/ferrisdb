@@ -456,8 +456,11 @@ impl LWLock {
     }
 
     /// 锁定等待队列
+    ///
+    /// 等待队列锁的临界区极短（只做链表操作），
+    /// 使用有限 spin + park_timeout 避免 livelock。
     fn lock_wait_list(&self) {
-        let mut spins = 100;
+        let mut spins: u32 = 0;
         loop {
             let old_state = self.state.load(Ordering::Acquire);
             if !is_wait_list_locked(old_state) {
@@ -470,12 +473,12 @@ impl LWLock {
                     return;
                 }
             }
-            spins -= 1;
-            if spins <= 0 {
-                std::thread::yield_now();
-                spins = 100;
-            } else {
+            spins += 1;
+            if spins < 100 {
                 std::hint::spin_loop();
+            } else {
+                std::thread::park_timeout(Duration::from_micros(1));
+                spins = 0;
             }
         }
     }
@@ -497,9 +500,19 @@ impl LWLock {
         }
     }
 
-    /// 在锁上等待（纯自旋 + yield，不 sleep）
+    /// 在锁上等待
+    ///
+    /// 三阶段退避策略（参照 C++ dstore PerformSpinDelay）：
+    /// 1. 少量 spin_loop（CPU pause 指令，~100 次）
+    /// 2. yield + 短 sleep（让出时间片，防止 livelock）
+    /// 3. OS 级 park 阻塞（长等待，通过 wakeup_waiters 唤醒）
+    ///
+    /// 与之前的纯 spin+yield 不同，阶段 3 使用 thread::park_timeout 实现
+    /// 真正的 OS 级阻塞，避免在 llvm-cov 等插桩环境下 livelock。
     fn wait_on_lock(&self, mode: LockMode) {
-        let mut spins = 0;
+        let mut spins: u32 = 0;
+        let mut sleep_us: u64 = 1;
+
         loop {
             let state = self.state.load(Ordering::Acquire);
 
@@ -522,15 +535,17 @@ impl LWLock {
 
             spins += 1;
             if spins < 100 {
+                // Phase 1: CPU spin（快速路径，锁即将释放时有效）
                 std::hint::spin_loop();
-            } else if spins < 1000 {
-                std::hint::spin_loop();
-                std::hint::spin_loop();
-                std::hint::spin_loop();
-                std::hint::spin_loop();
-            } else {
+            } else if spins < 200 {
+                // Phase 2: yield + 短 sleep（让出时间片）
                 std::thread::yield_now();
-                spins = 0;
+            } else {
+                // Phase 3: OS 级阻塞（指数退避 1μs → 1ms 上限）
+                // 参照 C++ dstore thrd->Sleep() — 真正阻塞而非 spin
+                std::thread::park_timeout(Duration::from_micros(sleep_us));
+                sleep_us = (sleep_us * 2).min(1000); // 指数退避，上限 1ms
+                spins = 100; // 回到 Phase 2 重新尝试
             }
         }
     }

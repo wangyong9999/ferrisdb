@@ -6,6 +6,7 @@ use crate::atomic::{AtomicU32, Ordering};
 use crate::atomic::helpers::{spin_try_lock as try_lock_internal, spin_unlock as unlock_internal};
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
+use std::time::Duration;
 
 /// 自旋锁
 #[derive(Debug)]
@@ -28,12 +29,25 @@ impl<T> SpinLock<T> {
 
     /// 获取锁
     ///
-    /// 自旋直到成功获取锁
+    /// 参照 C++ dstore PerformSpinDelay：自旋 + 指数退避 sleep。
+    /// SpinLock 保护的临界区应极短（<100 指令），
+    /// 超过 spin 阈值说明有真正的竞争，使用 park_timeout 阻塞。
     #[inline]
     pub fn acquire(&self) {
+        let mut spins: u32 = 0;
         loop {
             if try_lock_internal(&self.lock) {
                 return;
+            }
+            spins += 1;
+            if spins < 100 {
+                std::hint::spin_loop();
+            } else if spins < 200 {
+                std::thread::yield_now();
+            } else {
+                // 临界区不应这么长——可能在插桩环境下
+                std::thread::park_timeout(Duration::from_micros(1));
+                spins = 100;
             }
         }
     }

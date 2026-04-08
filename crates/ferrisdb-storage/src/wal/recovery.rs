@@ -1122,31 +1122,6 @@ impl WalRecovery {
         Ok(true)
     }
 
-    // ========== Undo Redo ==========
-
-    /// Redo: Undo 记录插入
-    fn redo_undo_insert(
-        &self,
-        record_lsn: Lsn,
-        data: &[u8],
-        ctx: &mut RedoContext,
-    ) -> Result<bool> {
-        let (page_rec, _payload) = match Self::parse_page_record(data) {
-            Some(r) => r,
-            None => return Ok(false),
-        };
-        let page_id = page_rec.page_id;
-
-        let page_data = match Self::prepare_redo(ctx, &page_id, record_lsn)? {
-            Some(d) => d,
-            None => return Ok(false),
-        };
-
-        // Undo 页面记录直接写入
-        Self::finish_redo(ctx, page_id, record_lsn, page_data);
-        Ok(true)
-    }
-
     /// 回滚未提交事务
     ///
     /// 扫描 redo 阶段收集的 txn_states 和 txn_undo_actions，
@@ -1215,98 +1190,6 @@ impl WalRecovery {
     /// 获取 WAL 文件路径
     fn get_file_path(&self, file_no: u32) -> PathBuf {
         self.wal_dir.join(format!("{:08X}.wal", file_no))
-    }
-}
-
-/// WAL Reader
-///
-/// 用于读取 WAL 记录。
-pub struct WalReader {
-    /// WAL 文件
-    file: File,
-    /// 当前偏移量
-    offset: u64,
-    /// 文件号
-    file_no: u32,
-    /// 是否到达末尾
-    eof: bool,
-}
-
-impl WalReader {
-    /// 创建新的 Reader
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut file = File::open(path.as_ref())
-            .map_err(|e| FerrisDBError::Wal(ferrisdb_core::error::WalError::ReadFailed(
-                format!("Failed to open WAL file: {}", e)
-            )))?;
-
-        let mut header_buf = [0u8; WalFileHeader::size()];
-        file.read_exact(&mut header_buf)
-            .map_err(|e| FerrisDBError::Wal(ferrisdb_core::error::WalError::ReadFailed(
-                format!("Failed to read WAL header: {}", e)
-            )))?;
-
-        let header = WalFileHeader::from_bytes(&header_buf);
-        if header.magic != WAL_FILE_MAGIC {
-            return Err(FerrisDBError::Wal(ferrisdb_core::error::WalError::Corruption));
-        }
-
-        let offset = WalFileHeader::size() as u64;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| FerrisDBError::Wal(ferrisdb_core::error::WalError::ReadFailed(
-                format!("Failed to seek: {}", e)
-            )))?;
-
-        Ok(Self {
-            file,
-            offset,
-            file_no: 0,
-            eof: false,
-        })
-    }
-
-    /// 读取下一条记录
-    pub fn read_next(&mut self) -> Result<Option<(Lsn, WalRecordHeader, Vec<u8>)>> {
-        if self.eof {
-            return Ok(None);
-        }
-
-        let mut header_buf = [0u8; std::mem::size_of::<WalRecordHeader>()];
-        match self.file.read_exact(&mut header_buf) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                self.eof = true;
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(FerrisDBError::Wal(ferrisdb_core::error::WalError::ReadFailed(
-                    format!("Failed to read record header: {}", e)
-                )));
-            }
-        }
-
-        let header = unsafe {
-            std::ptr::read(header_buf.as_ptr() as *const WalRecordHeader)
-        };
-
-        let mut data = vec![0u8; header.size as usize];
-        match self.file.read_exact(&mut data) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                self.eof = true;
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(FerrisDBError::Wal(ferrisdb_core::error::WalError::ReadFailed(
-                    format!("Failed to read record data: {}", e)
-                )));
-            }
-        }
-
-        let lsn = Lsn::from_parts(self.file_no, self.offset as u32);
-        self.offset += std::mem::size_of::<WalRecordHeader>() as u64 + header.size as u64;
-
-        Ok(Some((lsn, header, data)))
     }
 }
 

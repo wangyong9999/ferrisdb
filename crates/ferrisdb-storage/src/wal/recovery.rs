@@ -998,12 +998,13 @@ impl WalRecovery {
             None => return Ok(false),
         };
 
-        let mut page_buf = page_data;
+        // 使用对齐缓冲区（BTreePage 同样需要 8192 字节对齐）
+        let mut aligned = AlignedPageBuf::from_vec(&page_data);
 
         // 解析 BTreeItem 并插入到页面
         if !payload.is_empty() {
             if let Some(item) = crate::index::BTreeItem::deserialize(payload) {
-                let btree_page = crate::index::BTreePage::from_bytes(&mut page_buf);
+                let btree_page = crate::index::BTreePage::from_bytes(&mut aligned.data);
                 // 如果页面未初始化，先初始化
                 if btree_page.header().nkeys == 0 && btree_page.header().level == 0
                     && btree_page.header().page_type == 0 {
@@ -1015,7 +1016,7 @@ impl WalRecovery {
             }
         }
 
-        Self::finish_redo(ctx, page_id, record_lsn, page_buf);
+        Self::finish_redo(ctx, page_id, record_lsn, aligned.data.to_vec());
         Ok(true)
     }
 

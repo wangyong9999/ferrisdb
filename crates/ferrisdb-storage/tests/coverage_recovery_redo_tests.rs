@@ -242,7 +242,6 @@ fn test_recovery_heap_page_full() {
 // ============================================================
 
 #[test]
-#[ignore] // BUG: recovery BTree redo uses Vec<u8> without 8KB alignment for BTreePage::from_bytes
 fn test_recovery_btree_leaf_insert() {
     let td = TempDir::new().unwrap();
     let wal_dir = make_wal_dir(&td);
@@ -273,7 +272,6 @@ fn test_recovery_btree_leaf_insert() {
 // ============================================================
 
 #[test]
-#[ignore] // BUG: same alignment issue as btree_leaf_insert
 fn test_recovery_btree_internal_insert() {
     let td = TempDir::new().unwrap();
     let wal_dir = make_wal_dir(&td);

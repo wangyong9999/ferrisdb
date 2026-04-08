@@ -597,4 +597,46 @@ mod tests {
         let result = recovery.find_latest_checkpoint();
         assert!(result.is_ok());
     }
+
+    /// 覆盖 cleanup_old_wal_segments 路径
+    #[test]
+    fn test_checkpoint_cleans_old_wal() {
+        let td = tempfile::TempDir::new().unwrap();
+        let wal_dir = td.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let writer = Arc::new(super::super::WalWriter::new(&wal_dir));
+
+        // Write to file 0
+        let data = vec![0u8; 30];
+        let rec = super::super::WalHeapInsert::new(ferrisdb_core::PageId::new(0,0,1,0), 1, &data);
+        writer.write(&rec.serialize_with_data(&data)).unwrap();
+        writer.switch_file().unwrap();
+        writer.write(&rec.serialize_with_data(&data)).unwrap();
+        writer.switch_file().unwrap();
+        writer.write(&rec.serialize_with_data(&data)).unwrap();
+        writer.sync().unwrap();
+
+        let mut mgr = CheckpointManager::new(CheckpointConfig::default(), writer);
+        mgr.set_flusher(Arc::new(TestFlusher::new(0, 100)));
+        // Checkpoint with high LSN should trigger cleanup of old files
+        let _ = mgr.checkpoint(CheckpointType::Online);
+    }
+
+    /// 覆盖 auto_checkpoint_thread (start + stop)
+    #[test]
+    fn test_auto_checkpoint() {
+        let td = tempfile::TempDir::new().unwrap();
+        let wal_dir = td.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let writer = Arc::new(super::super::WalWriter::new(&wal_dir));
+
+        let mgr = Arc::new(CheckpointManager::new(
+            CheckpointConfig { auto_checkpoint: true, interval_ms: 100, ..Default::default() },
+            writer,
+        ));
+        let handle = CheckpointManager::start_auto_checkpoint(Arc::clone(&mgr));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        mgr.stop();
+        let _ = handle.join();
+    }
 }

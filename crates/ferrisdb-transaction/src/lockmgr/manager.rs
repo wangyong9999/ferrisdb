@@ -233,4 +233,69 @@ mod tests {
         for h in handles { h.join().unwrap(); }
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 400);
     }
+
+    /// 覆盖 wait_for_lock 路径：T1 持锁 → T2 等待 → T1 释放 → T2 获得
+    #[test]
+    fn test_wait_for_lock_path() {
+        let mgr = Arc::new(LockManager::new());
+        let tag = LockTag::Relation(400);
+        let xid1 = Xid::new(0, 1);
+        let xid2 = Xid::new(0, 2);
+
+        mgr.acquire(tag.clone(), LockMode::Exclusive, xid1).unwrap();
+
+        let mgr2 = Arc::clone(&mgr);
+        let tag2 = tag.clone();
+        let t = std::thread::spawn(move || {
+            // 会走 wait_for_lock 路径
+            mgr2.acquire(tag2.clone(), LockMode::Exclusive, xid2).unwrap();
+            mgr2.release(&tag2).unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        mgr.release(&tag).unwrap();
+        t.join().unwrap();
+    }
+
+    /// 覆盖 try_acquire + 慢速路径 create new lock
+    #[test]
+    fn test_try_acquire_nonexistent() {
+        let mgr = LockManager::new();
+        // 锁不存在时 try_acquire 返回 false
+        assert!(!mgr.try_acquire(&LockTag::Relation(999), LockMode::Share));
+    }
+
+    /// 覆盖 release 不存在的锁
+    #[test]
+    fn test_release_not_held() {
+        let mgr = LockManager::new();
+        let result = mgr.release(&LockTag::Relation(888));
+        assert!(result.is_err());
+    }
+
+    /// 覆盖 acquire shared 路径 (快速路径: 锁已存在)
+    #[test]
+    fn test_acquire_shared_on_existing() {
+        let mgr = LockManager::new();
+        let tag = LockTag::Relation(500);
+        let xid1 = Xid::new(0, 1);
+        let xid2 = Xid::new(0, 2);
+
+        // 第一次 acquire 创建锁
+        mgr.acquire(tag.clone(), LockMode::Share, xid1).unwrap();
+        // 第二次 acquire 走快速路径 (锁已存在)
+        mgr.acquire(tag.clone(), LockMode::Share, xid2).unwrap();
+        mgr.release(&tag).unwrap();
+        mgr.release(&tag).unwrap();
+    }
+
+    /// 覆盖 lock_count
+    #[test]
+    fn test_lock_count() {
+        let mgr = LockManager::default();
+        assert_eq!(mgr.lock_count(), 0);
+        mgr.acquire(LockTag::Tuple(1, 0, 1), LockMode::Exclusive, Xid::new(0, 1)).unwrap();
+        mgr.acquire(LockTag::Page(1, 5), LockMode::Share, Xid::new(0, 1)).unwrap();
+        assert_eq!(mgr.lock_count(), 2);
+    }
 }

@@ -3,6 +3,7 @@
 //! 事务管理、MVCC 可见性、Undo 和锁管理。
 
 #![deny(missing_docs)]
+#![allow(dead_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::all)]
 

@@ -3,6 +3,7 @@
 //! 存储引擎核心模块：Buffer Pool、Page、WAL、Storage Manager、Index。
 
 #![deny(missing_docs)]
+#![allow(dead_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::all)]
 

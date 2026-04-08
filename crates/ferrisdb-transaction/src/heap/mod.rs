@@ -1123,6 +1123,7 @@ impl<'a> HeapScan<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrisdb_storage::BufferPoolConfig;
 
     #[test]
     fn test_tuple_header_size() {
@@ -1161,5 +1162,131 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 100);
         assert_eq!(u16::from_le_bytes(bytes[28..30].try_into().unwrap()), 5);
         assert_eq!(restored.infomask, header.infomask);
+    }
+
+    #[test]
+    fn test_heap_with_wal_buffer() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(200)).unwrap());
+        let mut tm = TransactionManager::new(16);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let wal_buf = Arc::new(WalBuffer::new(64 * 1024));
+        let heap = HeapTable::with_wal(1, bp, tm, wal_buf);
+        assert_eq!(heap.table_oid(), 1);
+    }
+
+    #[test]
+    fn test_heap_wal_enable_disable() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(200)).unwrap());
+        let mut tm = TransactionManager::new(16);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::new(2, Arc::clone(&bp), Arc::clone(&tm));
+        heap.disable_wal();
+        let mut txn = tm.begin().unwrap();
+        // 插入在 WAL 禁用模式下
+        let tid = heap.insert(b"no_wal", txn.xid(), 0).unwrap();
+        assert!(tid.is_valid());
+        txn.commit().unwrap();
+        heap.enable_wal();
+    }
+
+    #[test]
+    fn test_heap_scan_multi_page() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(500)).unwrap());
+        let mut tm = TransactionManager::new(64);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::new(3, Arc::clone(&bp), Arc::clone(&tm));
+
+        let mut txn = tm.begin().unwrap();
+        // 插入足够多的数据跨多个页面
+        for i in 0..80u32 {
+            heap.insert(&vec![i as u8; 200], txn.xid(), i).unwrap();
+        }
+        txn.commit().unwrap();
+
+        // HeapScan::next() 遍历多页
+        let mut scan = HeapScan::new(&heap);
+        let mut count = 0;
+        while let Ok(Some(_)) = scan.next() {
+            count += 1;
+        }
+        assert!(count >= 80);
+    }
+
+    #[test]
+    fn test_heap_update_with_undo() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(500)).unwrap());
+        let mut tm = TransactionManager::new(64);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::new(4, Arc::clone(&bp), Arc::clone(&tm));
+
+        let mut txn = tm.begin().unwrap();
+        let xid = txn.xid();
+        let tid = heap.insert(b"original", xid, 0).unwrap();
+        let new_tid = heap.update_with_undo(tid, b"updated!", xid, 1, Some(&mut txn)).unwrap();
+        assert!(new_tid.is_valid());
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_heap_vacuum_with_dead_tuples() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(500)).unwrap());
+        let mut tm = TransactionManager::new(64);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::new(5, Arc::clone(&bp), Arc::clone(&tm));
+
+        // Insert + commit + delete + commit
+        let mut txn1 = tm.begin().unwrap();
+        let tids: Vec<_> = (0..5).map(|i| {
+            heap.insert(&vec![i as u8; 50], txn1.xid(), i).unwrap()
+        }).collect();
+        txn1.commit().unwrap();
+
+        let mut txn2 = tm.begin().unwrap();
+        for (i, tid) in tids.iter().enumerate() {
+            heap.delete(*tid, txn2.xid(), i as u32).unwrap();
+        }
+        txn2.commit().unwrap();
+
+        // vacuum exercises do_vacuum_page
+        heap.vacuum();
+    }
+
+    #[test]
+    fn test_heap_set_wal_writer() {
+        let td = tempfile::TempDir::new().unwrap();
+        let wal_dir = td.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let writer = Arc::new(ferrisdb_storage::wal::WalWriter::new(&wal_dir));
+
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(200)).unwrap());
+        let mut tm = TransactionManager::new(16);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let mut heap = HeapTable::new(6, bp, tm);
+        heap.set_wal_writer(writer);
+    }
+
+    #[test]
+    fn test_heap_with_wal_writer_insert() {
+        let td = tempfile::TempDir::new().unwrap();
+        let wal_dir = td.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let writer = Arc::new(ferrisdb_storage::wal::WalWriter::new(&wal_dir));
+
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(500)).unwrap());
+        let mut tm = TransactionManager::new(64);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::with_wal_writer(7, Arc::clone(&bp), Arc::clone(&tm), writer);
+
+        let mut txn = tm.begin().unwrap();
+        let tid = heap.insert(b"with_wal_writer", txn.xid(), 0).unwrap();
+        assert!(tid.is_valid());
+        txn.commit().unwrap();
     }
 }

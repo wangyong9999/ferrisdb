@@ -829,6 +829,104 @@ mod tests {
         // 验证共享锁获取成功
         assert!(has_shared(after));
     }
+
+    /// 覆盖 wait_shared 路径：T1 持排他锁 → T2 被迫走 wait_shared
+    #[test]
+    fn test_wait_shared_path() {
+        let lock = Arc::new(LWLock::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        lock.acquire_exclusive();
+
+        let lock2 = Arc::clone(&lock);
+        let bar2 = Arc::clone(&barrier);
+        let t = thread::spawn(move || {
+            bar2.wait();
+            lock2.acquire_shared();
+            lock2.release_shared();
+        });
+
+        barrier.wait();
+        thread::sleep(std::time::Duration::from_millis(5));
+        lock.release_exclusive();
+
+        t.join().unwrap();
+    }
+
+    /// 覆盖 wait_exclusive 路径：T1 持共享锁 → T2 被迫走 wait_exclusive
+    #[test]
+    fn test_wait_exclusive_path() {
+        let lock = Arc::new(LWLock::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        lock.acquire_shared();
+
+        let lock2 = Arc::clone(&lock);
+        let bar2 = Arc::clone(&barrier);
+        let t = thread::spawn(move || {
+            bar2.wait();
+            lock2.acquire_exclusive();
+            lock2.release_exclusive();
+        });
+
+        barrier.wait();
+        thread::sleep(std::time::Duration::from_millis(5));
+        lock.release_shared();
+
+        t.join().unwrap();
+    }
+
+    /// 覆盖 wakeup_waiters：释放排他锁唤醒多个 shared waiters
+    #[test]
+    fn test_wakeup_multiple_shared_waiters() {
+        let lock = Arc::new(LWLock::new());
+        lock.acquire_exclusive();
+
+        let mut handles = vec![];
+        for _ in 0..3 {
+            let lock = Arc::clone(&lock);
+            handles.push(thread::spawn(move || {
+                lock.acquire_shared();
+                lock.release_shared();
+            }));
+        }
+
+        thread::sleep(std::time::Duration::from_millis(10));
+        lock.release_exclusive();
+
+        for h in handles { h.join().unwrap(); }
+    }
+
+    /// 覆盖 spin_delay 自适应
+    #[test]
+    fn test_spin_delay_adaptive() {
+        let lock = LWLock::new();
+        let r1 = lock.spin_delay(50);
+        assert!(r1 > 0);
+        let r2 = lock.spin_delay(200);
+        assert!(r2 > 0);
+    }
+
+    /// 覆盖 load_low32
+    #[test]
+    fn test_load_low32() {
+        let lock = LWLock::new();
+        assert_eq!(lock.load_low32(), 0);
+    }
+
+    /// LWLockWaiter 方法覆盖
+    #[test]
+    fn test_lwlock_waiter_methods() {
+        let waiter = LWLockWaiter::new();
+        assert!(!waiter.is_waiting());
+        waiter.set_waiting(true);
+        assert!(waiter.is_waiting());
+        waiter.set_waiting(false);
+        waiter.set_mode(LockMode::Exclusive);
+        assert!(matches!(waiter.wait_mode(), LockMode::Exclusive));
+        waiter.set_mode(LockMode::Shared);
+        assert!(matches!(waiter.wait_mode(), LockMode::Shared));
+    }
 }
 
 // ========== loom 并发测试 ==========
@@ -894,4 +992,5 @@ mod loom_tests {
             assert_eq!(counter.load(Ordering::Relaxed), 2);
         });
     }
+
 }

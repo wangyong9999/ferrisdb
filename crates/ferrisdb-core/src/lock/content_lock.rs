@@ -95,7 +95,21 @@ impl ContentLock {
             if spins < SPIN_LIMIT {
                 std::hint::spin_loop();
             } else {
-                self.park_wait();
+                // 使用 park_timeout 带指数退避
+                let key = self.park_key();
+                unsafe {
+                    parking_lot_core::park(
+                        key,
+                        || {
+                            let state = self.state.load(Ordering::Acquire);
+                            has_exclusive(state) || is_disallow_preempt(state)
+                        },
+                        || {},
+                        |_, _| {},
+                        parking_lot_core::DEFAULT_PARK_TOKEN,
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(1)),
+                    );
+                }
                 spins = 0;
             }
         }
@@ -118,16 +132,52 @@ impl ContentLock {
     // ========== 排他锁 ==========
 
     /// 获取排他锁
+    ///
+    /// 使用 DISALLOW_PREEMPT 防止写者饥饿：等待时设置该标志，
+    /// 阻止新共享锁获取（已持有的共享锁不受影响，会自然释放）。
+    /// 参照 C++ dstore LWLockAcquire<LW_EXCLUSIVE> + DISALLOW_PREEMPT 机制。
     pub fn acquire_exclusive(&self) {
+        // 快速路径：无竞争直接获取
+        let old_state = self.state.load(Ordering::Acquire);
+        if can_acquire(old_state) {
+            let new_state = old_state | EXCLUSIVE;
+            if self.state.compare_exchange(
+                old_state, new_state, Ordering::AcqRel, Ordering::Relaxed,
+            ).is_ok() {
+                return;
+            }
+        }
+
+        // 慢速路径：设置 DISALLOW_PREEMPT 防止新 reader 进入
+        self.acquire_exclusive_slow();
+    }
+
+    fn acquire_exclusive_slow(&self) {
+        // 设置 DISALLOW_PREEMPT — 新的 acquire_shared 会看到并回退
+        let _ = self.state.fetch_or(DISALLOW_PREEMPT, Ordering::AcqRel);
+
         let mut spins: u32 = 0;
         loop {
             let old_state = self.state.load(Ordering::Acquire);
-            if can_acquire(old_state) {
-                let new_state = old_state | EXCLUSIVE;
+            // can_acquire 检查无 SHARED/EXCLUSIVE，但我们已设置 DISALLOW_PREEMPT
+            // 只需检查无其他锁持有者
+            if !has_exclusive(old_state) && !has_shared(old_state) {
+                // 清除 DISALLOW_PREEMPT 并设置 EXCLUSIVE
+                let new_state = (old_state & !DISALLOW_PREEMPT) | EXCLUSIVE;
                 if self.state.compare_exchange_weak(
                     old_state, new_state, Ordering::AcqRel, Ordering::Relaxed,
                 ).is_ok() {
-                    return; // AcqRel on CAS already provides acquire semantics
+                    return;
+                }
+                continue;
+            }
+            // 只剩 shared 持有者时（无 exclusive），等 share count 降到 0
+            if !has_exclusive(old_state) && get_share_count(old_state) == 0 {
+                let new_state = (old_state & !DISALLOW_PREEMPT & !SHARED) | EXCLUSIVE;
+                if self.state.compare_exchange_weak(
+                    old_state, new_state, Ordering::AcqRel, Ordering::Relaxed,
+                ).is_ok() {
+                    return;
                 }
                 continue;
             }

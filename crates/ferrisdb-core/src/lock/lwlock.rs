@@ -449,7 +449,11 @@ impl LWLock {
     }
 
     /// 等待排他锁
+    ///
+    /// 设置 DISALLOW_PREEMPT 防止写者饥饿（新 reader 会看到并回退）。
     fn wait_exclusive(&self) {
+        // 设置 DISALLOW_PREEMPT — 阻止新 reader 进入
+        let _ = self.state.fetch_or(DISALLOW_PREEMPT, Ordering::AcqRel);
         self.lock_wait_list();
         self.unlock_wait_list();
         self.wait_on_lock(LockMode::Exclusive);
@@ -525,8 +529,14 @@ impl LWLock {
                     }
                 }
                 LockMode::Exclusive => {
-                    if can_acquire(state) {
-                        if self.try_acquire_exclusive() {
+                    // 检查是否可获取（忽略自己设置的 DISALLOW_PREEMPT）
+                    let effective = state & !DISALLOW_PREEMPT;
+                    if can_acquire(effective) {
+                        // CAS: 清除 DISALLOW_PREEMPT + 设置 EXCLUSIVE
+                        let new = (state & !DISALLOW_PREEMPT) | EXCLUSIVE;
+                        if self.state.compare_exchange_weak(
+                            state, new, Ordering::AcqRel, Ordering::Relaxed,
+                        ).is_ok() {
                             return;
                         }
                     }

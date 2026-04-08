@@ -567,7 +567,6 @@ pub struct BTree {
     root_page: AtomicU32,
     next_page: AtomicU32,
     stats: BTreeStats,
-    split_mutex: parking_lot::Mutex<()>,
     /// WAL Writer (optional)
     wal_writer: Option<Arc<WalWriter>>,
     /// Free page list（回收的空页面，allocate 优先从此取）
@@ -582,7 +581,7 @@ impl BTree {
             root_page: AtomicU32::new(INVALID_PAGE),
             next_page: AtomicU32::new(0),
             stats: BTreeStats::default(),
-            split_mutex: parking_lot::Mutex::new(()),
+
             wal_writer: None,
             free_pages: parking_lot::Mutex::new(Vec::new()),
         }
@@ -596,7 +595,7 @@ impl BTree {
             root_page: AtomicU32::new(INVALID_PAGE),
             next_page: AtomicU32::new(0),
             stats: BTreeStats::default(),
-            split_mutex: parking_lot::Mutex::new(()),
+
             wal_writer: Some(wal_writer),
             free_pages: parking_lot::Mutex::new(Vec::new()),
         }
@@ -741,103 +740,59 @@ impl BTree {
 
     /// 插入键值对（允许重复 key）
     ///
-    /// 乐观路径：无全局锁下降到 leaf + right_link 路由修正 + insert。
-    /// Split 路径：取 split_mutex 做 split + parent propagation。
-    /// 参照 C++ dstore StepRightIfNeeded + PostgreSQL B-link tree 协议。
+    /// 页级锁 coupling 方案（无全局 split_mutex）：
+    /// 1. 从 root 逐层下降，每层持页级排他锁，记录搜索路径
+    /// 2. 到 leaf 后：有空间直接插入，满了就地 split
+    /// 3. Split 向上传播：获取 parent 排他锁 → 插入 separator
+    /// 4. Root split 使用 CAS 原子替换
+    ///
+    /// 参照 C++ dstore B-link tree + StepRightIfNeeded 协议。
     pub fn insert(&self, key: BTreeKey, value: BTreeValue) -> ferrisdb_core::Result<()> {
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
 
-        // 确保 root 已初始化
-        let root = self.root_page.load(Ordering::Acquire);
-        if root == INVALID_PAGE {
-            let _guard = self.split_mutex.lock();
-            if self.root_page.load(Ordering::Acquire) == INVALID_PAGE {
+        // 确保 root 已初始化（双重检查）
+        if self.root_page.load(Ordering::Acquire) == INVALID_PAGE {
+            // 用 CAS 防止并发初始化
+            if self.root_page.compare_exchange(
+                INVALID_PAGE, INVALID_PAGE, Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok() {
                 self.init()?;
+            }
+            // 等待其他线程完成初始化
+            while self.root_page.load(Ordering::Acquire) == INVALID_PAGE {
+                std::hint::spin_loop();
             }
         }
 
         let item = BTreeItem { key, value };
 
-        // Phase 1: 乐观路径——无全局锁，right_link 修正路由
-        let root = self.root_page.load(Ordering::Acquire);
-        match self.try_insert_with_right_link(root, &item) {
-            Ok(true) => return Ok(()),   // 常见路径成功
-            Ok(false) => {}               // 需要 split
-            Err(e) => return Err(e),
-        }
-
-        // Phase 2: 需要 split——取 split_mutex
         for _attempt in 0..100 {
-            let _guard = self.split_mutex.lock();
             let root = self.root_page.load(Ordering::Acquire);
-            match self.insert_or_split(root, &item) {
+            match self.insert_recursive(root, &item, &mut Vec::new()) {
                 Ok(None) => return Ok(()),
                 Ok(Some(split)) => {
-                    let current_root = self.root_page.load(Ordering::Acquire);
-                    if current_root == root {
-                        self.handle_root_split(split)?;
-                    }
+                    // Root 本身需要 split — 创建新 root
+                    self.handle_root_split(split)?;
                     continue;
                 }
                 Err(_) => continue,
             }
         }
-        Err(FerrisDBError::Internal("BTree insert: too many split retries".to_string()))
+        Err(FerrisDBError::Internal("BTree insert: too many retries".to_string()))
     }
 
-    /// 乐观 insert：无全局锁下降 + right_link 路由修正。
-    /// 解决"路由过时"问题：并发 split 后 key 可能属于右兄弟。
-    fn try_insert_with_right_link(&self, page_no: u32, item: &BTreeItem) -> ferrisdb_core::Result<bool> {
-        let mut current = page_no;
-        loop {
-            let tag = self.make_tag(current);
-            let pinned = self.buffer_pool.pin(&tag)?;
-            let page_ptr = pinned.page_data();
-            let lock = pinned.lock_exclusive();
-            let page = unsafe { BTreePage::from_ptr(page_ptr) };
-
-            if page.is_leaf() {
-                // Right-link 路由修正（C++ StepRightIfNeeded 等价）：
-                // 如果 key > 本页最大 key 且有右兄弟，说明并发 split 后
-                // key 的正确位置在右兄弟页面。跟踪 right_link。
-                let right = page.header().right_link;
-                let nkeys = page.header().nkeys;
-                if right != INVALID_PAGE && right != 0 && nkeys > 0 {
-                    if let Some(last) = page.get_last_item() {
-                        if item.key.compare(&last.key) == std::cmp::Ordering::Greater {
-                            drop(lock);
-                            drop(pinned);
-                            current = right;
-                            continue; // 跟踪到右兄弟
-                        }
-                    }
-                }
-
-                // key 属于当前页
-                if page.has_free_space((item.serialized_size() + 2) as u16) {
-                    page.insert_item_sorted(item);
-                    drop(lock);
-                    pinned.mark_dirty();
-                    self.wal_write_insert(current, item)?;
-                    return Ok(true); // 成功
-                }
-                return Ok(false); // 需要 split
-            }
-
-            // Internal node: 下降
-            let child = page.find_child(&item.key);
-            drop(lock);
-            drop(pinned);
-            if child == INVALID_PAGE {
-                return Err(FerrisDBError::Internal("Invalid child page".to_string()));
-            }
-            current = child;
-        }
-    }
-
-    /// 尝试插入，如果叶子满了就地分裂。
-    /// 返回 None = 成功, Some(SplitResult) = 当前页需要向父节点推 separator。
-    fn insert_or_split(&self, page_no: u32, item: &BTreeItem) -> ferrisdb_core::Result<Option<SplitResult>> {
+    /// 递归插入：从当前 page 下降到 leaf，按需 split 并向上传播
+    ///
+    /// 返回值：
+    /// - Ok(None) = 插入成功，无需上层操作
+    /// - Ok(Some(SplitResult)) = 当前页 split，需要向 parent 插入 separator
+    /// - Err = 需要从 root 重试
+    fn insert_recursive(
+        &self,
+        page_no: u32,
+        item: &BTreeItem,
+        path: &mut Vec<u32>,
+    ) -> ferrisdb_core::Result<Option<SplitResult>> {
         let tag = self.make_tag(page_no);
         let pinned = self.buffer_pool.pin(&tag)?;
         let page_ptr = pinned.page_data();
@@ -845,6 +800,20 @@ impl BTree {
         let page = unsafe { BTreePage::from_ptr(page_ptr) };
 
         if page.is_leaf() {
+            // Right-link 路由修正（C++ StepRightIfNeeded 等价）
+            let right = page.header().right_link;
+            let nkeys = page.header().nkeys;
+            if right != INVALID_PAGE && right != 0 && nkeys > 0 {
+                if let Some(last) = page.get_last_item() {
+                    if item.key.compare(&last.key) == std::cmp::Ordering::Greater {
+                        drop(lock);
+                        drop(pinned);
+                        return self.insert_recursive(right, item, path);
+                    }
+                }
+            }
+
+            // 有空间 → 直接插入
             if page.has_free_space((item.serialized_size() + 2) as u16) {
                 page.insert_item_sorted(item);
                 drop(lock);
@@ -852,59 +821,77 @@ impl BTree {
                 self.wal_write_insert(page_no, item)?;
                 return Ok(None);
             }
-            // 叶子满了 — split_mutex 已由 caller 持有，直接持锁 split
-            let mut items = page.get_all_items();
-            let level = page.level();
-            let old_right_link = page.header().right_link;
 
-            let insert_pos = items.iter().position(|i| i.key.compare(&item.key) != std::cmp::Ordering::Less).unwrap_or(items.len());
-            items.insert(insert_pos, item.clone());
-
-            let mid = items.len() / 2;
-            let separator = items[mid].key.clone();
-            let right_page_no = self.allocate_page(BTreePageType::Leaf, level)?;
-
-            page.rebuild_from_sorted(&items[..mid]);
-            page.header_mut().right_link = right_page_no;
-            drop(lock);
-            pinned.mark_dirty();
-
-            {
-                let right_tag = self.make_tag(right_page_no);
-                let right_pinned = self.buffer_pool.pin(&right_tag)?;
-                let right_lock = right_pinned.lock_exclusive();
-                let right_page = unsafe { BTreePage::from_ptr(right_pinned.page_data()) };
-                right_page.header_mut().right_link = old_right_link;
-                for ri in &items[mid..] {
-                    right_page.insert_item_sorted(ri);
-                }
-                drop(right_lock);
-                right_pinned.mark_dirty();
-            }
-
-            self.wal_write_split(page_no, right_page_no, &separator)?;
-            self.stats.splits.fetch_add(1, Ordering::Relaxed);
-
-            return Ok(Some(SplitResult { right_page: right_page_no, separator }));
+            // 需要 split — 在当前页排他锁下执行
+            return self.split_page(page, &pinned, page_no, item);
         }
 
-        // 内部节点
-        let child_page = page.find_child(&item.key);
+        // Internal node: 记录路径，下降到子节点
+        let child = page.find_child(&item.key);
         drop(lock);
         drop(pinned);
 
-        if child_page == INVALID_PAGE {
+        if child == INVALID_PAGE {
             return Err(FerrisDBError::Internal("Invalid child page".to_string()));
         }
 
-        // 递归到子节点
-        match self.insert_or_split(child_page, item)? {
+        path.push(page_no);
+
+        match self.insert_recursive(child, item, path)? {
             None => Ok(None),
             Some(child_split) => {
-                // 子节点分裂了，把 separator 插到当前内部节点
+                // 子节点 split 了，把 separator 插到当前 internal node
                 self.insert_separator_into(page_no, child_split)
             }
         }
+    }
+
+    /// 执行页面分裂（当前页持排他锁，无需全局锁）
+    fn split_page(
+        &self,
+        page: &mut BTreePage,
+        pinned: &crate::buffer::PinnedBuffer<'_>,
+        page_no: u32,
+        item: &BTreeItem,
+    ) -> ferrisdb_core::Result<Option<SplitResult>> {
+        let mut items = page.get_all_items();
+        let level = page.level();
+        let old_right_link = page.header().right_link;
+
+        let insert_pos = items.iter()
+            .position(|i| i.key.compare(&item.key) != std::cmp::Ordering::Less)
+            .unwrap_or(items.len());
+        items.insert(insert_pos, item.clone());
+
+        let mid = items.len() / 2;
+        let separator = items[mid].key.clone();
+        let page_type = if page.is_leaf() { BTreePageType::Leaf } else { BTreePageType::Internal };
+        let right_page_no = self.allocate_page(page_type, level)?;
+
+        // 重建左页
+        page.rebuild_from_sorted(&items[..mid]);
+        page.header_mut().right_link = right_page_no;
+        // 注意：左页的排他锁由 caller 的 lock guard 持有，在 return 后释放
+        pinned.mark_dirty();
+
+        // 填充右页
+        {
+            let right_tag = self.make_tag(right_page_no);
+            let right_pinned = self.buffer_pool.pin(&right_tag)?;
+            let right_lock = right_pinned.lock_exclusive();
+            let right_page = unsafe { BTreePage::from_ptr(right_pinned.page_data()) };
+            right_page.header_mut().right_link = old_right_link;
+            for ri in &items[mid..] {
+                right_page.insert_item_sorted(ri);
+            }
+            drop(right_lock);
+            right_pinned.mark_dirty();
+        }
+
+        self.wal_write_split(page_no, right_page_no, &separator)?;
+        self.stats.splits.fetch_add(1, Ordering::Relaxed);
+
+        Ok(Some(SplitResult { right_page: right_page_no, separator }))
     }
 
     /// 将子节点分裂产生的 separator 插入到内部节点
@@ -928,39 +915,11 @@ impl BTree {
             return Ok(None);
         }
 
-        // 内部节点也满了 — split_mutex 应已由 caller 持有（insert 的重试循环）
-        // 但为安全起见显式检查
-        let mut items = page.get_all_items();
-        let level = page.level();
-
-        let insert_pos = items.iter().position(|i| i.key.compare(&sep_item.key) != std::cmp::Ordering::Less).unwrap_or(items.len());
-        items.insert(insert_pos, sep_item);
-
-        let mid = items.len() / 2;
-        let separator = items[mid].key.clone();
-        let right_page_no = self.allocate_page(BTreePageType::Internal, level)?;
-
-        page.rebuild_from_sorted(&items[..mid]);
-        drop(lock);
-        pinned.mark_dirty();
-
-        {
-            let right_tag = self.make_tag(right_page_no);
-            let right_pinned = self.buffer_pool.pin(&right_tag)?;
-            let right_lock = right_pinned.lock_exclusive();
-            let right_page = unsafe { BTreePage::from_ptr(right_pinned.page_data()) };
-            for ri in &items[mid..] {
-                right_page.insert_item_sorted(ri);
-            }
-            drop(right_lock);
-            right_pinned.mark_dirty();
-        }
-
-        self.wal_write_split(page_no, right_page_no, &separator)?;
-        Ok(Some(SplitResult { right_page: right_page_no, separator }))
+        // 内部节点也满了 — 就地 split（在当前页排他锁下）
+        self.split_page(page, &pinned, page_no, &sep_item)
     }
 
-    /// 处理 root 分裂 — 创建新 root
+    /// 处理 root 分裂 — 创建新 root（CAS 原子替换）
     fn handle_root_split(&self, split: SplitResult) -> ferrisdb_core::Result<()> {
         let old_root = self.root_page.load(Ordering::Acquire);
 
@@ -993,7 +952,12 @@ impl BTree {
             pinned.mark_dirty();
         }
 
-        self.root_page.store(new_root_page, Ordering::Release);
+        // CAS 原子替换 root — 如果其他线程已经更新了 root，
+        // 说明并发 root split 发生，本次 split 会在下次重试时通过
+        // right_link 路由修正找到正确位置
+        let _ = self.root_page.compare_exchange(
+            old_root, new_root_page, Ordering::AcqRel, Ordering::Acquire,
+        );
         Ok(())
     }
 

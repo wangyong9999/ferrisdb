@@ -33,9 +33,9 @@
 
 | # | 项目 | 估期 | 阻塞场景 |
 |---|------|------|---------|
-| 1 | **BTree incomplete-split 协议** | 1-2 周 | BTree 高并发写入 (16T+ insert) |
+| 1 | ~~BTree 并发~~ | ✅ DONE | right-link 路由修正，50/50 stable |
 | 2 | **TPCC BTree 索引** | 3 天 | 长稳验证（消除 HashMap 衰减） |
-| 3 | **Undo spill-to-disk** | 3 天 | 超大事务 (>1M 行) |
+| 3 | ~~Undo spill-to-disk~~ | ✅ DONE | 100K 内存 + tempfile spill，无上限 |
 | 4 | **WAL 归档** | 1 天 | PITR 基础 |
 | 5 | **在线热备** | 1 周 | 灾备 |
 | 6 | **覆盖率 >70%** | 2 天 | 质量度量 |

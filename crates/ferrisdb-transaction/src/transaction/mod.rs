@@ -209,6 +209,10 @@ pub struct Transaction {
     wal_writer: Option<Arc<WalWriter>>,
     /// WAL Ring Buffer 引用（DML + commit 同路径保序）
     wal_ring: Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>>,
+    /// Undo spill 临时文件（大事务溢出到磁盘）
+    undo_spill_file: Option<std::fs::File>,
+    /// Undo spill 条目数
+    undo_spill_count: usize,
     /// 事务超时（毫秒，0=无限制）
     timeout_ms: u64,
 }
@@ -224,6 +228,8 @@ impl Transaction {
             buffer_pool: None,
             wal_writer: None,
             wal_ring: None,
+            undo_spill_file: None,
+            undo_spill_count: 0,
             timeout_ms: 0,
         }
     }
@@ -245,6 +251,8 @@ impl Transaction {
             buffer_pool: Some(buffer_pool),
             wal_writer,
             wal_ring,
+            undo_spill_file: None,
+            undo_spill_count: 0,
             timeout_ms,
         }
     }
@@ -383,18 +391,43 @@ impl Transaction {
     /// 同时写入内存 undo_log 和 WAL（如果启用了 WalWriter）。
     /// 错误传播：Undo WAL 写入失败或 undo_log 过大都返回错误。
     pub fn push_undo(&mut self, action: UndoAction) -> ferrisdb_core::Result<()> {
-        // 大小限制：防止长事务 OOM（默认 1M 条 undo action）
-        const MAX_UNDO_ACTIONS: usize = 1_000_000;
-        if self.undo_log.len() >= MAX_UNDO_ACTIONS {
-            return Err(FerrisDBError::Transaction(TransactionError::InvalidState(
-                format!("Transaction too large: undo_log has {} actions (limit {}). Consider committing in smaller batches.", self.undo_log.len(), MAX_UNDO_ACTIONS)
-            )));
-        }
-        if let Some(ref writer) = self.wal_writer {
+        // WAL 持久化 undo record
+        if let Some(ref ring) = self.wal_ring {
+            let wal_data = action.serialize_for_wal(self.info.xid);
+            ring.write(&wal_data);
+        } else if let Some(ref writer) = self.wal_writer {
             let wal_data = action.serialize_for_wal(self.info.xid);
             writer.write(&wal_data)?;
         }
-        self.undo_log.push(action);
+
+        // 分级 undo：内存 100K 条 + 磁盘 spill（无上限）
+        const SPILL_THRESHOLD: usize = 100_000;
+        if self.undo_log.len() < SPILL_THRESHOLD {
+            self.undo_log.push(action);
+        } else {
+            // Spill to temp file
+            self.spill_undo_to_disk(&action)?;
+        }
+        Ok(())
+    }
+
+    /// 将 undo action 溢出到临时文件
+    fn spill_undo_to_disk(&mut self, action: &UndoAction) -> ferrisdb_core::Result<()> {
+        use std::io::Write;
+        let file = self.undo_spill_file.get_or_insert_with(|| {
+            let path = std::env::temp_dir().join(format!("ferrisdb_undo_{}.tmp", self.info.xid.raw()));
+            std::fs::OpenOptions::new()
+                .create(true).write(true).append(true)
+                .open(&path)
+                .expect("Failed to create undo spill file")
+        });
+        let bytes = action.serialize_for_wal(self.info.xid);
+        let len = bytes.len() as u32;
+        file.write_all(&len.to_le_bytes())
+            .map_err(|e| FerrisDBError::Internal(format!("Undo spill write failed: {}", e)))?;
+        file.write_all(&bytes)
+            .map_err(|e| FerrisDBError::Internal(format!("Undo spill write failed: {}", e)))?;
+        self.undo_spill_count += 1;
         Ok(())
     }
 
@@ -586,8 +619,12 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         if self.active {
-            // 自动回滚未提交的事务
             let _ = self.abort();
+        }
+        // 清理 undo spill 临时文件
+        if self.undo_spill_count > 0 {
+            let path = std::env::temp_dir().join(format!("ferrisdb_undo_{}.tmp", self.info.xid.raw()));
+            let _ = std::fs::remove_file(&path);
         }
     }
 }

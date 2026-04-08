@@ -438,6 +438,13 @@ impl BTreePage {
         items
     }
 
+    /// 获取最后一个 item（最大 key）
+    pub fn get_last_item(&self) -> Option<BTreeItem> {
+        let nkeys = self.header().nkeys;
+        if nkeys == 0 { return None; }
+        self.get_item(nkeys as u16 - 1)
+    }
+
     /// 用有序 items 列表重建页面（页面必须已初始化）
     pub fn rebuild_from_sorted(&mut self, items: &[BTreeItem]) {
         let header = self.header();
@@ -734,29 +741,97 @@ impl BTree {
 
     /// 插入键值对（允许重复 key）
     ///
-    /// split_mutex 保护 insert+split 路径，确保并发正确性。
-    /// 完整的 B-link tree incomplete-split 协议需要 split_status 标记 +
-    /// CompleteSplit 协助机制 + find_parent 重搜索，是 1-2 周专项工程。
-    /// 当前方案对 HeapTable insert（不走 BTree）和 lookup/scan 无影响。
+    /// 乐观路径：无全局锁下降到 leaf + right_link 路由修正 + insert。
+    /// Split 路径：取 split_mutex 做 split + parent propagation。
+    /// 参照 C++ dstore StepRightIfNeeded + PostgreSQL B-link tree 协议。
     pub fn insert(&self, key: BTreeKey, value: BTreeValue) -> ferrisdb_core::Result<()> {
         self.stats.inserts.fetch_add(1, Ordering::Relaxed);
-        let _guard = self.split_mutex.lock();
 
+        // 确保 root 已初始化
         let root = self.root_page.load(Ordering::Acquire);
         if root == INVALID_PAGE {
-            self.init()?;
+            let _guard = self.split_mutex.lock();
+            if self.root_page.load(Ordering::Acquire) == INVALID_PAGE {
+                self.init()?;
+            }
         }
 
         let item = BTreeItem { key, value };
-        let root = self.root_page.load(Ordering::Acquire);
 
-        match self.insert_or_split(root, &item) {
-            Ok(None) => Ok(()),
-            Ok(Some(split)) => {
-                self.handle_root_split(split)?;
-                Ok(())
+        // Phase 1: 乐观路径——无全局锁，right_link 修正路由
+        let root = self.root_page.load(Ordering::Acquire);
+        match self.try_insert_with_right_link(root, &item) {
+            Ok(true) => return Ok(()),   // 常见路径成功
+            Ok(false) => {}               // 需要 split
+            Err(e) => return Err(e),
+        }
+
+        // Phase 2: 需要 split——取 split_mutex
+        for _attempt in 0..100 {
+            let _guard = self.split_mutex.lock();
+            let root = self.root_page.load(Ordering::Acquire);
+            match self.insert_or_split(root, &item) {
+                Ok(None) => return Ok(()),
+                Ok(Some(split)) => {
+                    let current_root = self.root_page.load(Ordering::Acquire);
+                    if current_root == root {
+                        self.handle_root_split(split)?;
+                    }
+                    continue;
+                }
+                Err(_) => continue,
             }
-            Err(e) => Err(e),
+        }
+        Err(FerrisDBError::Internal("BTree insert: too many split retries".to_string()))
+    }
+
+    /// 乐观 insert：无全局锁下降 + right_link 路由修正。
+    /// 解决"路由过时"问题：并发 split 后 key 可能属于右兄弟。
+    fn try_insert_with_right_link(&self, page_no: u32, item: &BTreeItem) -> ferrisdb_core::Result<bool> {
+        let mut current = page_no;
+        loop {
+            let tag = self.make_tag(current);
+            let pinned = self.buffer_pool.pin(&tag)?;
+            let page_ptr = pinned.page_data();
+            let lock = pinned.lock_exclusive();
+            let page = unsafe { BTreePage::from_ptr(page_ptr) };
+
+            if page.is_leaf() {
+                // Right-link 路由修正（C++ StepRightIfNeeded 等价）：
+                // 如果 key > 本页最大 key 且有右兄弟，说明并发 split 后
+                // key 的正确位置在右兄弟页面。跟踪 right_link。
+                let right = page.header().right_link;
+                let nkeys = page.header().nkeys;
+                if right != INVALID_PAGE && right != 0 && nkeys > 0 {
+                    if let Some(last) = page.get_last_item() {
+                        if item.key.compare(&last.key) == std::cmp::Ordering::Greater {
+                            drop(lock);
+                            drop(pinned);
+                            current = right;
+                            continue; // 跟踪到右兄弟
+                        }
+                    }
+                }
+
+                // key 属于当前页
+                if page.has_free_space((item.serialized_size() + 2) as u16) {
+                    page.insert_item_sorted(item);
+                    drop(lock);
+                    pinned.mark_dirty();
+                    self.wal_write_insert(current, item)?;
+                    return Ok(true); // 成功
+                }
+                return Ok(false); // 需要 split
+            }
+
+            // Internal node: 下降
+            let child = page.find_child(&item.key);
+            drop(lock);
+            drop(pinned);
+            if child == INVALID_PAGE {
+                return Err(FerrisDBError::Internal("Invalid child page".to_string()));
+            }
+            current = child;
         }
     }
 

@@ -433,151 +433,154 @@ impl LWLock {
         }
     }
 
-    // ========== 等待队列管理 ==========
+    // ========== FIFO 等待队列（parking_lot_core）==========
+    //
+    // 参照 C++ dstore LWLockQueueSelf + LWLockWakeup 协议：
+    // - 等待者入队到 FIFO 队列（parking_lot_core 内部维护）
+    // - ParkToken 区分 shared(0) vs exclusive(1)
+    // - 释放时选择性唤醒：所有前导 shared OR 一个 exclusive
+    //
+    // 对比之前的 thread::park_timeout 轮询方案：
+    // - 之前：等待者独立 park，靠超时重试检测锁状态（非公平）
+    // - 现在：释放者主动 unpark 等待者（FIFO 公平）
+
+    /// parking_lot_core 的 park key = state 字段地址
+    #[inline]
+    fn park_key(&self) -> usize {
+        &self.state as *const AtomicU64 as usize
+    }
+
+    /// ParkToken 编码
+    const PARK_TOKEN_SHARED: parking_lot_core::ParkToken = parking_lot_core::ParkToken(0);
+    const PARK_TOKEN_EXCLUSIVE: parking_lot_core::ParkToken = parking_lot_core::ParkToken(1);
 
     /// 等待共享锁
+    ///
+    /// 短 spin → parking_lot_core::park (FIFO 队列)
     fn wait_shared(&self) {
-        // 获取等待队列锁
-        self.lock_wait_list();
-
-        // 添加到等待队列
-        // 简化实现：使用条件变量等待
-        self.unlock_wait_list();
-
-        // 等待唤醒
-        self.wait_on_lock(LockMode::Shared);
-    }
-
-    /// 等待排他锁
-    ///
-    /// 设置 DISALLOW_PREEMPT 防止写者饥饿（新 reader 会看到并回退）。
-    fn wait_exclusive(&self) {
-        // 设置 DISALLOW_PREEMPT — 阻止新 reader 进入
-        let _ = self.state.fetch_or(DISALLOW_PREEMPT, Ordering::AcqRel);
-        self.lock_wait_list();
-        self.unlock_wait_list();
-        self.wait_on_lock(LockMode::Exclusive);
-    }
-
-    /// 锁定等待队列
-    ///
-    /// 等待队列锁的临界区极短（只做链表操作），
-    /// 使用有限 spin + park_timeout 避免 livelock。
-    fn lock_wait_list(&self) {
         let mut spins: u32 = 0;
         loop {
-            let old_state = self.state.load(Ordering::Acquire);
-            if !is_wait_list_locked(old_state) {
-                let new_state = old_state | WAIT_LIST_LOCKED;
-                if self
-                    .state
-                    .compare_exchange_weak(old_state, new_state, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
+            let state = self.state.load(Ordering::Acquire);
+            if !has_exclusive(state) && !is_disallow_preempt(state) {
+                if self.try_acquire_shared() {
                     return;
                 }
             }
+
             spins += 1;
-            if spins < 100 {
+            if spins < DEFAULT_SPINS_PER_DELAY as u32 {
                 std::hint::spin_loop();
             } else {
-                std::thread::park_timeout(Duration::from_micros(1));
+                // 入队 park — 等待 release 时被唤醒
+                unsafe {
+                    parking_lot_core::park(
+                        self.park_key(),
+                        || {
+                            // Validation: 仍然需要等待吗？
+                            let s = self.state.load(Ordering::Acquire);
+                            has_exclusive(s) || is_disallow_preempt(s)
+                        },
+                        || {},   // before_sleep
+                        |_, _| {}, // timed_out
+                        Self::PARK_TOKEN_SHARED,
+                        Some(std::time::Instant::now() + Duration::from_millis(5)),
+                    );
+                }
                 spins = 0;
             }
         }
     }
 
-    /// 解锁等待队列
-    fn unlock_wait_list(&self) {
-        let mut old_state = self.state.load(Ordering::Acquire);
-        loop {
-            let new_state = old_state & !WAIT_LIST_LOCKED;
-            match self.state.compare_exchange_weak(
-                old_state,
-                new_state,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(current) => old_state = current,
-            }
-        }
-    }
+    /// 等待排他锁
+    ///
+    /// 设置 DISALLOW_PREEMPT 防止写者饥饿，然后 park 等待。
+    fn wait_exclusive(&self) {
+        // 设置 DISALLOW_PREEMPT — 阻止新 reader 进入
+        let _ = self.state.fetch_or(DISALLOW_PREEMPT, Ordering::AcqRel);
 
-    /// 在锁上等待
-    ///
-    /// 三阶段退避策略（参照 C++ dstore PerformSpinDelay）：
-    /// 1. 少量 spin_loop（CPU pause 指令，~100 次）
-    /// 2. yield + 短 sleep（让出时间片，防止 livelock）
-    /// 3. OS 级 park 阻塞（长等待，通过 wakeup_waiters 唤醒）
-    ///
-    /// 与之前的纯 spin+yield 不同，阶段 3 使用 thread::park_timeout 实现
-    /// 真正的 OS 级阻塞，避免在 llvm-cov 等插桩环境下 livelock。
-    fn wait_on_lock(&self, mode: LockMode) {
         let mut spins: u32 = 0;
-        let mut sleep_us: u64 = 1;
-
         loop {
             let state = self.state.load(Ordering::Acquire);
-
-            match mode {
-                LockMode::Shared => {
-                    if !has_exclusive(state) && !is_disallow_preempt(state) {
-                        if self.try_acquire_shared() {
-                            return;
-                        }
-                    }
+            // 检查是否可获取（忽略自己设置的 DISALLOW_PREEMPT）
+            let effective = state & !DISALLOW_PREEMPT;
+            if can_acquire(effective) {
+                // CAS: 清除 DISALLOW_PREEMPT + 设置 EXCLUSIVE
+                let new = (state & !DISALLOW_PREEMPT) | EXCLUSIVE;
+                if self.state.compare_exchange_weak(
+                    state, new, Ordering::AcqRel, Ordering::Relaxed,
+                ).is_ok() {
+                    return;
                 }
-                LockMode::Exclusive => {
-                    // 检查是否可获取（忽略自己设置的 DISALLOW_PREEMPT）
-                    let effective = state & !DISALLOW_PREEMPT;
-                    if can_acquire(effective) {
-                        // CAS: 清除 DISALLOW_PREEMPT + 设置 EXCLUSIVE
-                        let new = (state & !DISALLOW_PREEMPT) | EXCLUSIVE;
-                        if self.state.compare_exchange_weak(
-                            state, new, Ordering::AcqRel, Ordering::Relaxed,
-                        ).is_ok() {
-                            return;
-                        }
-                    }
-                }
+                continue;
             }
 
             spins += 1;
-            if spins < 100 {
-                // Phase 1: CPU spin（快速路径，锁即将释放时有效）
+            if spins < DEFAULT_SPINS_PER_DELAY as u32 {
                 std::hint::spin_loop();
-            } else if spins < 200 {
-                // Phase 2: yield + 短 sleep（让出时间片）
-                std::thread::yield_now();
             } else {
-                // Phase 3: OS 级阻塞（指数退避 1μs → 1ms 上限）
-                // 参照 C++ dstore thrd->Sleep() — 真正阻塞而非 spin
-                std::thread::park_timeout(Duration::from_micros(sleep_us));
-                sleep_us = (sleep_us * 2).min(1000); // 指数退避，上限 1ms
-                spins = 100; // 回到 Phase 2 重新尝试
+                // 入队 park — 等待 release 时被唤醒
+                unsafe {
+                    parking_lot_core::park(
+                        self.park_key(),
+                        || {
+                            // Validation: 仍然需要等待吗？
+                            let s = self.state.load(Ordering::Acquire);
+                            let eff = s & !DISALLOW_PREEMPT;
+                            !can_acquire(eff)
+                        },
+                        || {},
+                        |_, _| {},
+                        Self::PARK_TOKEN_EXCLUSIVE,
+                        Some(std::time::Instant::now() + Duration::from_millis(5)),
+                    );
+                }
+                spins = 0;
             }
         }
     }
 
     /// 唤醒等待者
+    ///
+    /// FIFO 选择性唤醒（参照 C++ dstore LWLockWakeup）：
+    /// - 唤醒队列前端所有 shared waiters
+    /// - 遇到 exclusive waiter 唤醒它并停止
+    /// - 使用 parking_lot_core::unpark_filter 实现
     fn wakeup_waiters(&self) {
-        // 清除 HAS_WAITERS 标志
-        let mut old_state = self.state.load(Ordering::Acquire);
-        loop {
-            if !has_waiters(old_state) {
-                return;
-            }
+        let key = self.park_key();
+        let mut woke_exclusive = false;
 
-            let new_state = old_state & !HAS_WAITERS;
-            match self.state.compare_exchange_weak(
-                old_state,
-                new_state,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(current) => old_state = current,
+        unsafe {
+            parking_lot_core::unpark_filter(
+                key,
+                |token| {
+                    if woke_exclusive {
+                        // 已唤醒一个 exclusive，不再唤醒更多
+                        return parking_lot_core::FilterOp::Stop;
+                    }
+                    if token == Self::PARK_TOKEN_EXCLUSIVE {
+                        woke_exclusive = true;
+                        parking_lot_core::FilterOp::Unpark
+                    } else {
+                        // Shared waiter: 唤醒
+                        parking_lot_core::FilterOp::Unpark
+                    }
+                },
+                |_| parking_lot_core::DEFAULT_UNPARK_TOKEN,
+            );
+        }
+
+        // 清除 HAS_WAITERS 标志（如果队列已空）
+        if !woke_exclusive {
+            let mut old_state = self.state.load(Ordering::Acquire);
+            loop {
+                if !has_waiters(old_state) { return; }
+                let new_state = old_state & !HAS_WAITERS;
+                match self.state.compare_exchange_weak(
+                    old_state, new_state, Ordering::AcqRel, Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(current) => old_state = current,
+                }
             }
         }
     }

@@ -263,19 +263,28 @@ impl HeapTable {
     }
 
     /// FSM: 更新页面空闲空间等级（无锁）
+    ///
+    /// 顺序：先扩展 max_page 再写 level。
+    /// 反序会导致并发 fsm_find_page 看到 max_page 还没覆盖该页，
+    /// 跳过本可复用的页面 → 不必要的页面分配 → 表膨胀。
     fn fsm_update(&self, page_no: u32, free_space: u16) {
         let level = if free_space >= 8192 { 255 } else { (free_space as u32 * 255 / 8192) as u8 };
         let idx = page_no as usize;
         if idx < self.fsm.len() {
-            self.fsm[idx].store(level, std::sync::atomic::Ordering::Relaxed);
-            // 更新 max_page
+            // Step 1: 先确保 max_page 覆盖此页（让 find_page 能搜索到）
             let mut current_max = self.fsm_max_page.load(std::sync::atomic::Ordering::Acquire);
             while page_no >= current_max {
-                match self.fsm_max_page.compare_exchange(current_max, page_no + 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire) {
+                match self.fsm_max_page.compare_exchange(
+                    current_max, page_no + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
                     Ok(_) => break,
                     Err(v) => current_max = v,
                 }
             }
+            // Step 2: 写 FSM level（此时 find_page 已经能扫描到此页）
+            self.fsm[idx].store(level, std::sync::atomic::Ordering::Release);
         }
     }
 

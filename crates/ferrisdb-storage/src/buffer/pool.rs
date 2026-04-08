@@ -205,8 +205,11 @@ impl BufferPool {
     }
 
     /// 慢速路径：分配新 buffer 并读取页面
+    ///
+    /// alloc_lock 只保护 victim 选择 + hash table 更新（纯内存操作），
+    /// flush I/O 在锁外执行，避免阻塞其他线程的 buffer 分配。
     fn pin_slow(&self, tag: &BufferTag) -> Result<PinnedBuffer<'_>> {
-        // 等待获取分配锁（短自旋 + park 避免 livelock）
+        // 等待获取分配锁
         let mut spins = 0u32;
         while self.alloc_lock.compare_exchange(
             0, 1,
@@ -217,7 +220,7 @@ impl BufferPool {
             if spins < 40 {
                 std::hint::spin_loop();
             } else {
-                std::thread::yield_now();
+                std::thread::park_timeout(std::time::Duration::from_micros(1));
                 spins = 0;
             }
         }
@@ -234,9 +237,10 @@ impl BufferPool {
             });
         }
 
-        // 找一个空闲 buffer
+        // 找一个空闲 buffer 并 pin 它（防止被其他线程选中）
         let buf_id = self.find_victim()?;
         let desc = &self.buffers[buf_id as usize];
+        desc.pin(); // pin 保护 victim，即使释放 alloc_lock 也不会被其他线程换走
 
         // 从旧 hash 表移除
         let old_tag = desc.tag();
@@ -244,21 +248,33 @@ impl BufferPool {
             self.table.remove(&old_tag);
         }
 
-        // 脏页必须先 flush 成功才能替换（防止数据丢失）
-        if desc.is_dirty() {
-            // 在 alloc_lock 内 flush（确保 flush 失败时不丢页面）
+        // 脏页需要 flush——在锁外执行 I/O
+        let need_flush = desc.is_dirty();
+        if need_flush {
+            // 释放 alloc_lock，让其他线程可以继续分配
+            self.alloc_lock.store(0, Ordering::Release);
+
             if let Err(e) = self.flush_buffer(buf_id) {
-                // flush 失败：放弃这个 victim，释放锁，返回错误
-                self.alloc_lock.store(0, Ordering::Release);
+                // flush 失败：unpin victim，返回错误
+                desc.unpin();
                 return Err(FerrisDBError::Internal(format!(
                     "Buffer eviction failed: cannot flush dirty page: {:?}", e
                 )));
             }
+
+            // 重新获取 alloc_lock 完成 hash table 插入
+            spins = 0;
+            while self.alloc_lock.compare_exchange(
+                0, 1, Ordering::Acquire, Ordering::Relaxed,
+            ).is_err() {
+                spins += 1;
+                if spins < 40 { std::hint::spin_loop(); }
+                else { std::thread::park_timeout(std::time::Duration::from_micros(1)); spins = 0; }
+            }
         }
 
-        // flush 成功（或不需要 flush），安全替换 tag
+        // 在 alloc_lock 内完成 hash table 更新（纯内存操作，极快）
         self.table.insert(*tag, buf_id);
-        desc.pin();
         self.alloc_lock.store(0, Ordering::Release);
 
         // 读取新页面（alloc_lock 已释放，I/O 不阻塞其他线程）

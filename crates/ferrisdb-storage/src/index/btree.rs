@@ -787,6 +787,10 @@ impl BTree {
     /// - Ok(None) = 插入成功，无需上层操作
     /// - Ok(Some(SplitResult)) = 当前页 split，需要向 parent 插入 separator
     /// - Err = 需要从 root 重试
+    /// 递归插入：internal 用 shared lock 搜索，leaf 用 exclusive lock 修改
+    ///
+    /// 参照 C++ dstore：搜索路径只持 shared lock（允许并发读），
+    /// 仅在到达 leaf 时升级为 exclusive（最小化排他锁范围）。
     fn insert_recursive(
         &self,
         page_no: u32,
@@ -796,54 +800,63 @@ impl BTree {
         let tag = self.make_tag(page_no);
         let pinned = self.buffer_pool.pin(&tag)?;
         let page_ptr = pinned.page_data();
+
+        // 先用 shared lock 判断节点类型和路由
+        {
+            let lock = pinned.lock_shared();
+            let page = unsafe { BTreePage::from_ptr(page_ptr) };
+
+            if !page.is_leaf() {
+                // Internal node: shared lock 足够做路由决策
+                let child = page.find_child(&item.key);
+                drop(lock);
+                drop(pinned);
+
+                if child == INVALID_PAGE {
+                    return Err(FerrisDBError::Internal("Invalid child page".to_string()));
+                }
+
+                path.push(page_no);
+
+                return match self.insert_recursive(child, item, path)? {
+                    None => Ok(None),
+                    Some(child_split) => {
+                        self.insert_separator_into(page_no, child_split)
+                    }
+                };
+            }
+            // 是 leaf — 释放 shared lock，下面升级为 exclusive
+            drop(lock);
+        }
+
+        // Leaf node: 升级为 exclusive lock 进行修改
         let lock = pinned.lock_exclusive();
         let page = unsafe { BTreePage::from_ptr(page_ptr) };
 
-        if page.is_leaf() {
-            // Right-link 路由修正（C++ StepRightIfNeeded 等价）
-            let right = page.header().right_link;
-            let nkeys = page.header().nkeys;
-            if right != INVALID_PAGE && right != 0 && nkeys > 0 {
-                if let Some(last) = page.get_last_item() {
-                    if item.key.compare(&last.key) == std::cmp::Ordering::Greater {
-                        drop(lock);
-                        drop(pinned);
-                        return self.insert_recursive(right, item, path);
-                    }
+        // Right-link 路由修正（C++ StepRightIfNeeded 等价）
+        let right = page.header().right_link;
+        let nkeys = page.header().nkeys;
+        if right != INVALID_PAGE && right != 0 && nkeys > 0 {
+            if let Some(last) = page.get_last_item() {
+                if item.key.compare(&last.key) == std::cmp::Ordering::Greater {
+                    drop(lock);
+                    drop(pinned);
+                    return self.insert_recursive(right, item, path);
                 }
             }
-
-            // 有空间 → 直接插入
-            if page.has_free_space((item.serialized_size() + 2) as u16) {
-                page.insert_item_sorted(item);
-                drop(lock);
-                pinned.mark_dirty();
-                self.wal_write_insert(page_no, item)?;
-                return Ok(None);
-            }
-
-            // 需要 split — 在当前页排他锁下执行
-            return self.split_page(page, &pinned, page_no, item);
         }
 
-        // Internal node: 记录路径，下降到子节点
-        let child = page.find_child(&item.key);
-        drop(lock);
-        drop(pinned);
-
-        if child == INVALID_PAGE {
-            return Err(FerrisDBError::Internal("Invalid child page".to_string()));
+        // 有空间 → 直接插入
+        if page.has_free_space((item.serialized_size() + 2) as u16) {
+            page.insert_item_sorted(item);
+            drop(lock);
+            pinned.mark_dirty();
+            self.wal_write_insert(page_no, item)?;
+            return Ok(None);
         }
 
-        path.push(page_no);
-
-        match self.insert_recursive(child, item, path)? {
-            None => Ok(None),
-            Some(child_split) => {
-                // 子节点 split 了，把 separator 插到当前 internal node
-                self.insert_separator_into(page_no, child_split)
-            }
-        }
+        // 需要 split — 在当前页排他锁下执行
+        self.split_page(page, &pinned, page_no, item)
     }
 
     /// 执行页面分裂（当前页持排他锁，无需全局锁）

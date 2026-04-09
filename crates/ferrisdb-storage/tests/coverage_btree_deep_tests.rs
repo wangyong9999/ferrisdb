@@ -28,15 +28,11 @@ fn test_delete_many_triggers_merge_consideration() {
         let _ = tree.delete(&key(&format!("mg{:06}", i)));
     }
 
-    // Verify tree is still functional (some keys may be lost during merge — known issue)
-    let mut found = 0;
+    // merge 已禁用（P0 bug fix），remaining keys 必须全部存在
     for i in 990..1000u32 {
-        if tree.lookup(&key(&format!("mg{:06}", i))).unwrap().is_some() {
-            found += 1;
-        }
+        assert!(tree.lookup(&key(&format!("mg{:06}", i))).unwrap().is_some(),
+            "Key mg{:06} lost after mass delete!", i);
     }
-    // At least some should remain (merge may relocate but shouldn't lose all)
-    let _ = found;
 }
 
 #[test]

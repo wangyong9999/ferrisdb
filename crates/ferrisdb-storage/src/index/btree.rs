@@ -1050,10 +1050,11 @@ impl BTree {
                     drop(lock);
                     pinned.mark_dirty();
 
-                    // 尝试合并：如果页面 key 数低于 25% 容量且有右兄弟
-                    if nkeys > 0 && nkeys < 5 && right_link != INVALID_PAGE {
-                        let _ = self.try_merge_leaf(page_no, right_link);
-                    }
+                    // 注意：不做 eager merge。
+                    // B-link tree 中 merge 需要同时更新 parent 的 separator，
+                    // 这要求从 root 重新搜索 parent——复杂且有并发风险。
+                    // 与 C++ dstore / PostgreSQL 一致：由 VACUUM 后台异步清理空页面。
+                    let _ = (nkeys, right_link); // suppress unused warnings
                     return Ok(true);
                 }
                 return Ok(false);
@@ -1066,9 +1067,12 @@ impl BTree {
         }
     }
 
-    /// 尝试合并两个相邻叶子页面
+    /// 尝试合并两个相邻叶子页面（当前禁用，保留供 btree vacuum 使用）
     ///
-    /// 如果两个页面的 items 合并后能放入一页，则执行合并。
+    /// ⚠️ 已知问题：merge 后未更新 parent 内部节点中指向 right 页面的 separator，
+    /// 导致后续 lookup 可能沿 stale child pointer 到达空页面 → 丢键。
+    /// 启用前必须实现 parent separator 更新（需从 root 搜索 parent）。
+    #[allow(dead_code)]
     fn try_merge_leaf(&self, left_page: u32, right_page: u32) -> ferrisdb_core::Result<bool> {
         let left_tag = self.make_tag(left_page);
         let right_tag = self.make_tag(right_page);

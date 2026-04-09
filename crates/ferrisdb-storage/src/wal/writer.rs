@@ -118,13 +118,6 @@ impl WalWriter {
         &self.wal_dir
     }
 
-    /// 检查 LSN 是否有效（文件号非0或偏移量大于头部大小）
-    fn has_valid_lsn(&self) -> bool {
-        let file_no = self.file_no.load(Ordering::Acquire);
-        let offset = self.offset.load(Ordering::Acquire);
-        file_no > 0 || offset > WalFileHeader::size() as u64
-    }
-
     /// 获取当前 LSN
     #[inline]
     pub fn current_lsn(&self) -> Lsn {

@@ -286,34 +286,6 @@ impl ContentLock {
             parking_lot_core::unpark_one(key, |_| parking_lot_core::DEFAULT_UNPARK_TOKEN);
         }
     }
-
-    // ========== 内部辅助 ==========
-
-    fn try_set_shared_flag(&self) {
-        let mut old_state = self.state.load(Ordering::Acquire);
-        loop {
-            if has_shared(old_state) { return; }
-            match self.state.compare_exchange_weak(
-                old_state, old_state | SHARED, Ordering::AcqRel, Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(current) => old_state = current,
-            }
-        }
-    }
-
-    fn try_clear_shared_flag(&self, old_state: u64) {
-        let mut state = old_state;
-        loop {
-            if !has_shared(state) || get_share_count(state) > 0 { return; }
-            match self.state.compare_exchange_weak(
-                state, state & !SHARED, Ordering::AcqRel, Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(current) => state = current,
-            }
-        }
-    }
 }
 
 impl Default for ContentLock {

@@ -1067,56 +1067,6 @@ impl BTree {
         }
     }
 
-    /// 尝试合并两个相邻叶子页面（当前禁用，保留供 btree vacuum 使用）
-    ///
-    /// ⚠️ 已知问题：merge 后未更新 parent 内部节点中指向 right 页面的 separator，
-    /// 导致后续 lookup 可能沿 stale child pointer 到达空页面 → 丢键。
-    /// 启用前必须实现 parent separator 更新（需从 root 搜索 parent）。
-    #[allow(dead_code)]
-    fn try_merge_leaf(&self, left_page: u32, right_page: u32) -> ferrisdb_core::Result<bool> {
-        let left_tag = self.make_tag(left_page);
-        let right_tag = self.make_tag(right_page);
-
-        let left_pinned = self.buffer_pool.pin(&left_tag)?;
-        let right_pinned = self.buffer_pool.pin(&right_tag)?;
-
-        let left_lock = left_pinned.lock_exclusive();
-        let right_lock = right_pinned.lock_exclusive();
-
-        let left_pg = unsafe { BTreePage::from_ptr(left_pinned.page_data()) };
-        let right_pg = unsafe { BTreePage::from_ptr(right_pinned.page_data()) };
-
-        let left_items = left_pg.get_all_items();
-        let right_items = right_pg.get_all_items();
-
-        // 检查合并后是否能放入一页（预留 20% 空间防止立即再分裂）
-        let total_size: usize = left_items.iter().chain(right_items.iter())
-            .map(|i| i.serialized_size() + 2)
-            .sum();
-        let header_size = std::mem::size_of::<BTreePageHeader>();
-        if total_size + header_size > PAGE_SIZE * 80 / 100 {
-            return Ok(false); // 放不下
-        }
-
-        // 执行合并：所有 items 放到左页，右页清空
-        let right_right_link = right_pg.header().right_link;
-        left_pg.rebuild_from_sorted(&[left_items, right_items].concat());
-        left_pg.header_mut().right_link = right_right_link;
-
-        // 右页标记为空并回收
-        right_pg.header_mut().nkeys = 0;
-
-        drop(left_lock);
-        drop(right_lock);
-        left_pinned.mark_dirty();
-        right_pinned.mark_dirty();
-
-        // 回收空的右页面
-        self.recycle_page(right_page);
-
-        Ok(true)
-    }
-
     /// 前缀扫描：收集所有以 prefix 开头的键值对
     pub fn scan_prefix(&self, prefix: &[u8]) -> ferrisdb_core::Result<Vec<(Vec<u8>, BTreeValue)>> {
         let root = self.root_page.load(Ordering::Acquire);

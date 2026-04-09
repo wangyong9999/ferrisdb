@@ -954,68 +954,8 @@ impl HeapTable {
         total_reclaimed
     }
 
-    #[allow(dead_code)]
-    fn _prune_page_impl(&self, page_no: u32) {
-        // 保留旧实现供参考
-        let snapshot = self.txn_mgr.current_snapshot();
-
-        let tag = self.make_tag(page_no);
-        let pinned = match self.buffer_pool.pin(&tag) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        let page_ptr = pinned.page_data();
-        let _lock = pinned.lock_exclusive();
-
-        let page = unsafe { HeapPage::from_bytes(std::slice::from_raw_parts_mut(page_ptr, 8192)) };
-
-        let linp_count = page.linp_count() as usize;
-        if linp_count == 0 {
-            return;
-        }
-
-        let mut any_dead = false;
-
-        for i in 0..linp_count {
-            let item = match page.item_id(i as u16) {
-                Some(id) => id,
-                None => continue,
-            };
-
-            if item.lp_flags != ItemIdFlags::Normal as u8 {
-                continue;
-            }
-
-            let off = item.lp_off as usize;
-            let len = item.lp_len as usize;
-
-            if off + 32 > 8192 || len < 32 {
-                continue;
-            }
-
-            let data = &page.as_bytes()[off..off + len];
-            let xmin = Xid::from_raw(u64::from_le_bytes(data[0..8].try_into().unwrap()));
-            let xmax = Xid::from_raw(u64::from_le_bytes(data[8..16].try_into().unwrap()));
-
-            if !xmax.is_valid() {
-                continue;
-            }
-
-            if Self::is_tuple_dead_to_all(&xmin, &xmax, &snapshot, &self.txn_mgr) {
-                page.mark_dead((i + 1) as u16);
-                any_dead = true;
-            }
-        }
-
-        if any_dead {
-            let _reclaimed = page.compact_dead();
-            drop(_lock);
-            pinned.mark_dirty();
-        }
-    }
 
     /// 判断元组是否对所有活跃事务都不可见
-    #[allow(dead_code)]
     fn is_tuple_dead_to_all(xmin: &Xid, xmax: &Xid, snapshot: &Snapshot, txn_mgr: &TransactionManager) -> bool {
         let xmax_csn = txn_mgr.get_csn(*xmax);
         let xmin_csn = txn_mgr.get_csn(*xmin);

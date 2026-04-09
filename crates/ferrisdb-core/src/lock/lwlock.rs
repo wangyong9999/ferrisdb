@@ -207,50 +207,6 @@ impl LWLock {
         }
     }
 
-    /// 尝试设置 SHARED 标志
-    fn try_set_shared_flag(&self) {
-        let mut old_state = self.state.load(Ordering::Acquire);
-        loop {
-            if has_shared(old_state) {
-                // 已经设置了
-                return;
-            }
-
-            let new_state = old_state | SHARED;
-            match self.state.compare_exchange_weak(
-                old_state,
-                new_state,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(current) => old_state = current,
-            }
-        }
-    }
-
-    /// 尝试清除 SHARED 标志
-    fn try_clear_shared_flag(&self, old_state: u64) {
-        let mut state = old_state;
-        loop {
-            if !has_shared(state) || get_share_count(state) > 0 {
-                // 没有 SHARED 或还有计数，不需要清除
-                return;
-            }
-
-            let new_state = state & !SHARED;
-            match self.state.compare_exchange_weak(
-                state,
-                new_state,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(current) => state = current,
-            }
-        }
-    }
-
     /// 尝试获取共享锁（非阻塞）
     pub fn try_acquire_shared(&self) -> bool {
         let old_state = self.state.load(Ordering::Acquire);

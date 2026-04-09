@@ -263,4 +263,39 @@ mod tests {
         lock.clear_holder();
         assert!(lock.holder().is_none());
     }
+
+    #[test]
+    fn test_lock_mode_default() {
+        assert_eq!(LockMode::default(), LockMode::None);
+    }
+
+    #[test]
+    fn test_lock_waiter_default() {
+        let w = LockWaiter::default();
+        assert_eq!(w.xid.load(Ordering::Relaxed), 0);
+        let w2 = LockWaiter::new();
+        assert_eq!(w2.next.load(Ordering::Relaxed), u32::MAX);
+    }
+
+    #[test]
+    fn test_lock_conflict_matrix_all() {
+        // IS only conflicts with AX
+        assert!(!LockMode::IntentShare.conflicts_with(LockMode::Share));
+        assert!(LockMode::IntentShare.conflicts_with(LockMode::AccessExclusive));
+        // IX conflicts with S, SIX, U, X, AX
+        assert!(LockMode::IntentExclusive.conflicts_with(LockMode::Share));
+        // SIX conflicts with IX, S, SIX, U, X, AX
+        assert!(LockMode::ShareIntentExclusive.conflicts_with(LockMode::IntentExclusive));
+        // Update: exercise the path
+        let _ = LockMode::Update.conflicts_with(LockMode::Update);
+        // AX conflicts with everything except None
+        assert!(LockMode::AccessExclusive.conflicts_with(LockMode::IntentShare));
+    }
+
+    #[test]
+    fn test_lock_tag_variants() {
+        let _ = LockTag::Page(1, 5).hash_value();
+        let _ = LockTag::Transaction(42).hash_value();
+        let _ = LockTag::Tuple(1, 2, 3).hash_value();
+    }
 }

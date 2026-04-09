@@ -196,4 +196,28 @@ mod tests {
         atomic.store(Xid::new(2, 200), Ordering::SeqCst);
         assert_eq!(atomic.load(Ordering::SeqCst), Xid::new(2, 200));
     }
+
+    #[test]
+    fn test_atomic_xid_compare_exchange() {
+        let atomic = AtomicXid::new(Xid::new(0, 10));
+        let result = atomic.compare_exchange(
+            Xid::new(0, 10), Xid::new(0, 20),
+            Ordering::SeqCst, Ordering::SeqCst,
+        );
+        assert!(result.is_ok());
+        assert_eq!(atomic.load(Ordering::SeqCst), Xid::new(0, 20));
+
+        // Failed CAS
+        let result2 = atomic.compare_exchange(
+            Xid::new(0, 10), Xid::new(0, 30),
+            Ordering::SeqCst, Ordering::SeqCst,
+        );
+        assert!(result2.is_err());
+    }
+
+    #[test]
+    fn test_xid_is_invalid() {
+        assert!(Xid::INVALID.is_invalid());
+        assert!(!Xid::new(0, 1).is_invalid());
+    }
 }

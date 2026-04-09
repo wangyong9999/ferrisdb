@@ -34,6 +34,7 @@
 //! checkpoint.checkpoint(CheckpointType::Online)?;
 //! ```
 
+pub mod archive;
 mod buffer;
 mod checkpoint;
 mod parallel_redo;

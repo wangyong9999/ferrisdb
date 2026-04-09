@@ -144,6 +144,8 @@ pub struct CheckpointManager {
     shutdown: AtomicBool,
     /// Control file（持久化 checkpoint LSN）
     control_file: Option<Arc<crate::control::ControlFile>>,
+    /// WAL 归档器（checkpoint 删除旧 WAL 前先归档）
+    archiver: Option<Arc<super::archive::WalArchiver>>,
 }
 
 impl CheckpointManager {
@@ -161,6 +163,7 @@ impl CheckpointManager {
             stats: RwLock::new(CheckpointStats::default()),
             shutdown: AtomicBool::new(false),
             control_file: None,
+            archiver: None,
         }
     }
 
@@ -400,13 +403,24 @@ impl CheckpointManager {
         self.shutdown.store(true, Ordering::Release);
     }
 
-    /// 清理 checkpoint LSN 之前的旧 WAL 文件
+    /// 设置 WAL 归档器
+    pub fn set_archiver(&mut self, archiver: Arc<super::archive::WalArchiver>) {
+        self.archiver = Some(archiver);
+    }
+
+    /// 清理 checkpoint LSN 之前的旧 WAL 文件（归档后再删除）
     fn cleanup_old_wal_segments(&self, checkpoint_lsn: Lsn) {
         let (checkpoint_file_no, _) = checkpoint_lsn.parts();
         if checkpoint_file_no == 0 {
             return;
         }
         let wal_dir = self.wal_writer.wal_dir();
+
+        // 先归档，再删除（确保 PITR 数据不丢失）
+        if let Some(ref archiver) = self.archiver {
+            let _ = archiver.archive_up_to(wal_dir, checkpoint_file_no);
+        }
+
         if let Ok(entries) = std::fs::read_dir(wal_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();

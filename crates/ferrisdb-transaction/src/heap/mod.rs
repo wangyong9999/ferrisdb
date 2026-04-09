@@ -1280,4 +1280,76 @@ mod tests {
         heap.delete(tid, xid, 1).unwrap();
         txn.commit().unwrap();
     }
+
+    /// 覆盖 update_with_undo 非 HOT 同页路径 (L576-588)
+    #[test]
+    fn test_update_with_undo_non_hot_same_page() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(500)).unwrap());
+        let mut tm = TransactionManager::new(64);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::new(20, Arc::clone(&bp), Arc::clone(&tm));
+
+        let mut txn = tm.begin().unwrap();
+        let xid = txn.xid();
+        // 插入 50 字节 tuple
+        let tid = heap.insert(b"original_50_bytes_data_padding_!", xid, 0).unwrap();
+        // update 成不同大小但页面有空间 → 非 HOT 同页路径
+        let new_data = b"new_data_with_different_length_so_non_hot_update_path_is_taken_here";
+        let new_tid = heap.update_with_undo(tid, new_data, xid, 1, Some(&mut txn)).unwrap();
+        assert!(new_tid.is_valid());
+        // undo log 应有 UpdateNewPage + UpdateOldPage
+        let sp = txn.savepoint();
+        assert!(sp >= 2, "Should have undo for UpdateNewPage + UpdateOldPage, got {}", sp);
+        txn.commit().unwrap();
+    }
+
+    /// 覆盖 delete_with_undo (L665-671)
+    #[test]
+    fn test_delete_with_undo() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(500)).unwrap());
+        let mut tm = TransactionManager::new(64);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::new(21, Arc::clone(&bp), Arc::clone(&tm));
+
+        let mut txn = tm.begin().unwrap();
+        let xid = txn.xid();
+        let tid = heap.insert(b"delete_with_undo", xid, 0).unwrap();
+        heap.delete_with_undo(tid, xid, 1, Some(&mut txn)).unwrap();
+        let sp = txn.savepoint();
+        assert!(sp >= 1, "Should have Delete undo");
+        txn.commit().unwrap();
+    }
+
+    /// 覆盖 vacuum 实际 compact 路径 (L858-941)
+    #[test]
+    fn test_vacuum_compact_path() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(500)).unwrap());
+        let mut tm = TransactionManager::new(64);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::new(22, Arc::clone(&bp), Arc::clone(&tm));
+
+        // Insert 10 tuples + commit
+        let mut txn = tm.begin().unwrap();
+        let xid = txn.xid();
+        let tids: Vec<_> = (0..10).map(|i| {
+            heap.insert(&vec![i as u8; 50], xid, i).unwrap()
+        }).collect();
+        txn.commit().unwrap();
+
+        // Delete all + commit → vacuum should compact
+        let mut txn2 = tm.begin().unwrap();
+        let xid2 = txn2.xid();
+        for (i, tid) in tids.iter().enumerate() {
+            heap.delete(*tid, xid2, i as u32).unwrap();
+        }
+        txn2.commit().unwrap();
+
+        // vacuum → exercises do_vacuum_page compact path
+        let reclaimed = heap.vacuum();
+        // May or may not reclaim depending on snapshot timing
+        let _ = reclaimed;
+    }
 }

@@ -94,4 +94,6 @@ mod tests {
     #[test] fn test_should_log() { assert!(should_log(LogLevel::Error)); assert!(should_log(LogLevel::Info)); }
     #[test] fn test_log_msg_no_panic() { log_msg(LogLevel::Info, "test", "hello"); log_msg(LogLevel::Debug, "test", "debug"); }
     #[test] fn test_macros() { dstore_error!("test", "error {}", 42); dstore_info!("test", "info"); }
+    #[test] fn test_current_level() { let level = current_level(); let _ = level; }
+    #[test] fn test_level_ordering() { assert!(LogLevel::Error < LogLevel::Warn); assert!(LogLevel::Warn < LogLevel::Info); }
 }

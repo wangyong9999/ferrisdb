@@ -45,3 +45,15 @@ impl DListHead {
         self.head.is_null()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_dlist_head_new_empty() {
+        let head = DListHead::new();
+        assert!(head.is_empty());
+        let node = DListNode::default();
+        let _ = format!("{:?}", node);
+    }
+}

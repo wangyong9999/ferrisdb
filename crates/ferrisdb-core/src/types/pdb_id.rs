@@ -78,4 +78,13 @@ mod tests {
         let pdb = PdbId::INVALID;
         assert!(!pdb.is_valid());
     }
+
+    #[test]
+    fn test_pdb_id_from_raw_default() {
+        let pdb = PdbId::from_raw(42);
+        assert_eq!(pdb.raw(), 42);
+        let pdb2: PdbId = Default::default();
+        let _ = format!("{:?}", pdb2);
+        assert_eq!(pdb, PdbId::new(42));
+    }
 }

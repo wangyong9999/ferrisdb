@@ -102,4 +102,12 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
+
+    #[test]
+    fn test_file_tag_default_display() {
+        let ft: FileTag = Default::default();
+        let _ = format!("{:?}", ft);
+        let ft2 = FileTag::new(0, 0);
+        assert_eq!(ft, ft2);
+    }
 }

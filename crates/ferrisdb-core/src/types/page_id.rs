@@ -58,3 +58,15 @@ impl fmt::Display for PageId {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_page_id_new_valid() {
+        let pid = PageId::new(0, 0, 1, 5);
+        assert!(pid.is_valid());
+        let pid2 = PageId::default();
+        let _ = format!("{:?}", pid2);
+    }
+}

@@ -181,4 +181,15 @@ mod tests {
 
         assert!(lsn1.precedes(lsn2));
     }
+
+    #[test]
+    fn test_lsn_add_file_no_offset() {
+        let lsn = Lsn::from_parts(2, 500);
+        assert_eq!(lsn.file_no(), 2);
+        assert_eq!(lsn.offset(), 500);
+        let added = lsn.add(100);
+        assert_eq!(added.raw(), lsn.raw() + 100);
+        let _ = Lsn::INVALID;
+        let _ = format!("{:?}", lsn);
+    }
 }

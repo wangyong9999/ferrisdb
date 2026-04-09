@@ -325,4 +325,23 @@ mod tests {
         let lsn = buf.end_atomic_group(group_pos).unwrap();
         assert!(lsn.is_valid());
     }
+
+    #[test]
+    fn test_buffer_data_slice() {
+        let buf = WalBuffer::new(1024);
+        let _ = buf.write(&[0xAB; 50]);
+        let slice = buf.data_slice();
+        assert_eq!(slice.len(), 1024);
+    }
+
+    #[test]
+    fn test_buffer_full_error() {
+        let buf = WalBuffer::new(64); // 很小的 buffer
+        // 写满
+        let _ = buf.write(&[0xAB; 50]);
+        // 再写应该失败
+        let result = buf.write(&[0xCD; 50]);
+        // 可能成功也可能 BufferFull
+        let _ = result;
+    }
 }

@@ -166,4 +166,15 @@ mod tests {
         assert_eq!(waiter.get_mode(), LockMode::Shared);
         assert_eq!(waiter.get_waiting_on(), INVALID_NODE_INDEX);
     }
+
+    #[test]
+    fn test_lock_mode_default() {
+        assert_eq!(LockMode::default(), LockMode::Shared);
+    }
+
+    #[test]
+    fn test_waiter_default() {
+        let w: LWLockWaiter = Default::default();
+        assert!(!w.is_waiting());
+    }
 }

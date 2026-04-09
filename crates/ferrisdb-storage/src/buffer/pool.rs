@@ -727,4 +727,23 @@ mod tests {
         assert_eq!(pool.stat_hits(), 0);
         assert_eq!(pool.stat_misses(), 0);
     }
+
+    #[test]
+    fn test_config_default() {
+        let cfg = BufferPoolConfig::default();
+        assert_eq!(cfg.buffer_count, 1024);
+    }
+
+    #[test]
+    fn test_get_page_data_and_slice() {
+        let pool = BufferPool::new(BufferPoolConfig::new(10)).unwrap();
+        let tag = ferrisdb_core::BufferTag::new(ferrisdb_core::PdbId::new(0), 1, 0);
+        let pinned = pool.pin(&tag).unwrap();
+        let ptr = pool.get_page_data(pinned.buf_id());
+        assert!(ptr.is_some());
+        assert!(pool.get_page_data(-1).is_none());
+        let mut pinned2 = pool.pin(&tag).unwrap();
+        let slice = pinned2.page_slice_mut();
+        assert_eq!(slice.len(), PAGE_SIZE);
+    }
 }

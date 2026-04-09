@@ -507,17 +507,17 @@ mod tests {
 
     #[test]
     fn test_buf_state_accessors() {
-        let s = BufState::new();
+        let s = BufferState::new();
         assert!(!s.is_valid());
         assert!(!s.is_io_in_progress());
         assert!(!s.is_checkpoint_needed());
-        let s2: BufState = Default::default();
+        let s2: BufferState = Default::default();
         let _ = s2;
     }
 
     #[test]
     fn test_buffer_desc_accessors() {
-        let desc = BufferDesc::new(0);
+        let desc = BufferDesc::new();
         assert!(!desc.is_valid());
         let _ = desc.page_data();
         desc.pin();

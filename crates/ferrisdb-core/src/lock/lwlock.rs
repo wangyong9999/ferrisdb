@@ -7,11 +7,10 @@
 //! 3. 等待队列通过自旋锁保护
 //! 4. DISALLOW_PREEMPT 机制
 
-use crate::atomic::{AtomicI32, AtomicU16, AtomicU64, AtomicU8, AtomicPtr, Ordering};
-use crate::list::{ShmDListHead, ShmDListNode};
+use crate::atomic::{AtomicI32, AtomicU16, AtomicU64, Ordering};
+// ShmDList 等待队列已被 parking_lot_core FIFO 替代（单进程多线程模型）
 use crate::lock::state_bits::*;
 use crate::waiter::LockMode;
-use std::cell::UnsafeCell;
 use std::sync::atomic::fence;
 use std::time::Duration;
 
@@ -24,67 +23,8 @@ const MAX_SPINS_PER_DELAY: i32 = 1000;
 /// LWLock 等待者
 ///
 /// 每个线程持有一个，用于等待队列。
-#[derive(Debug)]
-#[repr(C)]
-pub struct LWLockWaiter {
-    /// 等待中标志
-    pub waiting: AtomicU8,
-    /// 等待的锁模式
-    pub mode: AtomicU8,
-    /// 链表节点
-    pub node: UnsafeCell<ShmDListNode>,
-    /// 关联的锁
-    pub lock: AtomicPtr<LWLock>,
-}
-
-impl LWLockWaiter {
-    /// 创建新的等待者
-    #[inline]
-    pub const fn new() -> Self {
-        Self {
-            waiting: AtomicU8::new(0),
-            mode: AtomicU8::new(0),
-            node: UnsafeCell::new(ShmDListNode::new()),
-            lock: AtomicPtr::new(std::ptr::null_mut()),
-        }
-    }
-
-    /// 检查是否在等待
-    #[inline]
-    pub fn is_waiting(&self) -> bool {
-        self.waiting.load(Ordering::Acquire) != 0
-    }
-
-    /// 设置等待状态
-    #[inline]
-    pub fn set_waiting(&self, waiting: bool) {
-        self.waiting.store(if waiting { 1 } else { 0 }, Ordering::Release);
-    }
-
-    /// 获取等待模式
-    #[inline]
-    pub fn wait_mode(&self) -> LockMode {
-        match self.mode.load(Ordering::Acquire) {
-            1 => LockMode::Exclusive,
-            _ => LockMode::Shared,
-        }
-    }
-
-    /// 设置等待模式
-    #[inline]
-    pub fn set_mode(&self, mode: LockMode) {
-        self.mode.store(
-            match mode {
-                LockMode::Shared => 0,
-                LockMode::Exclusive => 1,
-            },
-            Ordering::Release,
-        );
-    }
-}
-
-unsafe impl Send for LWLockWaiter {}
-unsafe impl Sync for LWLockWaiter {}
+// LWLockWaiter 已移除：单进程多线程模型使用 parking_lot_core FIFO 队列，
+// 不需要 ShmDList 基于索引的跨进程等待队列。
 
 /// LWLock 结构
 ///
@@ -98,9 +38,9 @@ pub struct LWLock {
     pub group_id: AtomicU16,
     /// 64 位状态字
     pub state: AtomicU64,
-    /// 等待队列
-    pub waiters: UnsafeCell<ShmDListHead>,
-    /// 保留填充
+    /// 保留填充（原 waiters 等待队列已用 parking_lot_core 替代）
+    _reserved: [u8; 8],  // 原 ShmDListHead 占位
+    /// 填充到 128 字节
     _padding: [u8; 80],
 }
 
@@ -112,7 +52,7 @@ impl LWLock {
             spins_per_delay: AtomicI32::new(DEFAULT_SPINS_PER_DELAY),
             group_id: AtomicU16::new(0),
             state: AtomicU64::new(0),
-            waiters: UnsafeCell::new(ShmDListHead::new()),
+            _reserved: [0; 8],
             _padding: [0; 80],
         }
     }
@@ -124,7 +64,7 @@ impl LWLock {
             spins_per_delay: AtomicI32::new(DEFAULT_SPINS_PER_DELAY),
             group_id: AtomicU16::new(group_id),
             state: AtomicU64::new(0),
-            waiters: UnsafeCell::new(ShmDListHead::new()),
+            _reserved: [0; 8],
             _padding: [0; 80],
         }
     }
@@ -870,19 +810,6 @@ mod tests {
         assert_eq!(lock.load_low32(), 0);
     }
 
-    /// LWLockWaiter 方法覆盖
-    #[test]
-    fn test_lwlock_waiter_methods() {
-        let waiter = LWLockWaiter::new();
-        assert!(!waiter.is_waiting());
-        waiter.set_waiting(true);
-        assert!(waiter.is_waiting());
-        waiter.set_waiting(false);
-        waiter.set_mode(LockMode::Exclusive);
-        assert!(matches!(waiter.wait_mode(), LockMode::Exclusive));
-        waiter.set_mode(LockMode::Shared);
-        assert!(matches!(waiter.wait_mode(), LockMode::Shared));
-    }
 }
 
 // ========== loom 并发测试 ==========

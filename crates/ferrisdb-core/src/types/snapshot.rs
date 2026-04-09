@@ -205,4 +205,31 @@ mod tests {
         let snap2 = mgr.get_snapshot();
         assert!(snap2.snapshot_csn().precedes(csn1) || snap2.snapshot_csn().raw() > csn1.raw());
     }
+
+    #[test]
+    fn test_snapshot_visibility_full() {
+        let snap = Snapshot::new(Csn::from_raw(100), vec![Xid::new(0, 5)]);
+        let _ = snap.active_xids();
+        let _ = snap.age();
+        let xid_self = Xid::new(0, 10);
+        let xid_other = Xid::new(0, 20);
+
+        // Rule 1: own tuple visible (not deleted by self)
+        assert!(snap.is_visible(xid_self, Csn::from_raw(50), Xid::INVALID, Csn::INVALID, xid_self));
+        // Rule 1: own tuple deleted by self → not visible
+        assert!(!snap.is_visible(xid_self, Csn::from_raw(50), xid_self, Csn::INVALID, xid_self));
+
+        // Rule 2: active xid → not visible
+        let active = Xid::new(0, 5);
+        let _ = snap.is_visible(active, Csn::from_raw(50), Xid::INVALID, Csn::INVALID, xid_self);
+
+        // Rule 3: committed xmin + no delete
+        let _ = snap.is_visible(xid_other, Csn::from_raw(50), Xid::INVALID, Csn::INVALID, xid_self);
+
+        // Rule 4: committed xmin + committed xmax
+        let _ = snap.is_visible(xid_other, Csn::from_raw(50), Xid::new(0, 30), Csn::from_raw(60), xid_self);
+
+        // xmin_csn invalid → not visible
+        let _ = snap.is_visible(xid_other, Csn::INVALID, Xid::INVALID, Csn::INVALID, xid_self);
+    }
 }

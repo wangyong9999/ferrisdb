@@ -226,4 +226,51 @@ mod tests {
         let dstore_err: FerrisDBError = buffer_err.into();
         assert!(matches!(dstore_err, FerrisDBError::Buffer(_)));
     }
+
+    #[test]
+    fn test_error_code() {
+        assert_eq!(FerrisDBError::Buffer(BufferError::PoolFull).error_code(), 1000);
+        assert_eq!(FerrisDBError::Lock(LockError::Deadlock).error_code(), 2000);
+        assert_eq!(FerrisDBError::Transaction(TransactionError::NotFound).error_code(), 3000);
+        assert_eq!(FerrisDBError::Wal(WalError::BufferFull).error_code(), 4000);
+        assert_eq!(FerrisDBError::Corruption("x".into()).error_code(), 6000);
+        assert_eq!(FerrisDBError::InvalidArgument("x".into()).error_code(), 7000);
+        assert_eq!(FerrisDBError::InvalidState("x".into()).error_code(), 7001);
+        assert_eq!(FerrisDBError::Timeout("x".into()).error_code(), 7002);
+        assert_eq!(FerrisDBError::NotImplemented("x".into()).error_code(), 7003);
+        assert_eq!(FerrisDBError::Internal("x".into()).error_code(), 9000);
+        assert_eq!(FerrisDBError::DuplicateKey("x".into()).error_code(), 8000);
+        assert_eq!(FerrisDBError::NotFound("x".into()).error_code(), 8001);
+    }
+
+    #[test]
+    fn test_is_retryable() {
+        assert!(FerrisDBError::Timeout("t".into()).is_retryable());
+        assert!(FerrisDBError::Lock(LockError::Deadlock).is_retryable());
+        assert!(!FerrisDBError::Internal("x".into()).is_retryable());
+        assert!(!FerrisDBError::Buffer(BufferError::PoolFull).is_retryable());
+    }
+
+    #[test]
+    fn test_all_error_types_display() {
+        // Exercise Display for all variants
+        let _ = format!("{}", FerrisDBError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test")));
+        let _ = format!("{}", WalError::FileError("f".into()));
+        let _ = format!("{}", WalError::WriteFailed("w".into()));
+        let _ = format!("{}", WalError::ReadFailed("r".into()));
+        let _ = format!("{}", WalError::InvalidLsn);
+        let _ = format!("{}", WalError::Corruption);
+        let _ = format!("{}", TransactionError::InvalidState("s".into()));
+        let _ = format!("{}", TransactionError::Timeout);
+        let _ = format!("{}", TransactionError::NoFreeSlot);
+        let _ = format!("{}", LockError::Conflict);
+        let _ = format!("{}", LockError::Timeout);
+        let _ = format!("{}", LockError::NotHeld);
+        let _ = format!("{}", LockError::WouldBlock);
+        let _ = format!("{}", BufferError::InvalidBufferId(0));
+        let _ = format!("{}", BufferError::Pinned);
+        let _ = format!("{}", BufferError::Io("io".into()));
+        let _ = format!("{}", BufferError::Corruption);
+        let _ = format!("{}", BufferError::TableFull);
+    }
 }

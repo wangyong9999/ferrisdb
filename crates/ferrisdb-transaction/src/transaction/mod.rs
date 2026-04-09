@@ -992,4 +992,42 @@ mod tests {
         let remaining = mgr.wait_for_all_transactions(100);
         assert_eq!(remaining, 0);
     }
+
+    /// 覆盖 undo_execute UpdateOldPage 路径
+    #[test]
+    fn test_abort_with_update_old_page_undo() {
+        let bp = Arc::new(ferrisdb_storage::BufferPool::new(
+            ferrisdb_storage::BufferPoolConfig::new(200),
+        ).unwrap());
+        let mut mgr = TransactionManager::new(64);
+        mgr.set_buffer_pool(Arc::clone(&bp));
+        let mgr = Arc::new(mgr);
+
+        let mut tx = mgr.begin().unwrap();
+        // Push UpdateOldPage undo
+        tx.push_undo(UndoAction::UpdateOldPage {
+            table_oid: 1, page_no: 0, tuple_offset: 1,
+            old_header: [0xAA; 32],
+        }).unwrap();
+        // Push UpdateNewPage undo
+        tx.push_undo(UndoAction::UpdateNewPage {
+            table_oid: 1, page_no: 0, tuple_offset: 2,
+        }).unwrap();
+        // Abort triggers undo_execute for both
+        tx.abort().unwrap();
+    }
+
+    /// 覆盖 allocate_csn 和 current_snapshot
+    #[test]
+    fn test_manager_csn_and_snapshot() {
+        let mgr = Arc::new(TransactionManager::new(64));
+        let csn1 = mgr.allocate_csn();
+        let csn2 = mgr.allocate_csn();
+        assert!(csn2.raw() > csn1.raw());
+
+        let snap = mgr.current_snapshot();
+        let _ = snap;
+
+        assert_eq!(mgr.active_transaction_count(), 0);
+    }
 }

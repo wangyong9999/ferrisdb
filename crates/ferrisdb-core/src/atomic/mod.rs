@@ -89,4 +89,20 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(atomic.load(Ordering::SeqCst), 20);
     }
+
+    #[test]
+    fn test_spin_lock_unlock() {
+        let lock = AtomicU32::new(0);
+        // Acquire + release
+        assert!(helpers::spin_try_lock(&lock));
+        helpers::spin_unlock(&lock);
+        // Re-acquire
+        assert!(helpers::spin_try_lock(&lock));
+        helpers::spin_unlock(&lock);
+    }
+
+    #[test]
+    fn test_spin_loop_call() {
+        helpers::spin_loop(); // just exercise the hint
+    }
 }

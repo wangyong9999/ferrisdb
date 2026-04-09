@@ -206,4 +206,26 @@ mod tests {
         assert_eq!(PAGE_SIZE, 8192);
         assert_eq!(PAGE_MASK, 8191);
     }
+
+    #[test]
+    fn test_page_type_default() {
+        assert_eq!(PageType::default(), PageType::Unused);
+    }
+
+    #[test]
+    fn test_page_header_methods() {
+        let mut h = PageHeader::new(PageType::BtreeIndex);
+        assert_eq!(h.page_type(), PageType::BtreeIndex);
+        assert!(h.has_free_space(100));
+        let _ = PageHeader::is_valid_page(&[0u8; PAGE_SIZE]);
+
+        // Test all page_type() match arms
+        h.pd_type = 0; assert_eq!(h.page_type(), PageType::Unused);
+        h.pd_type = 1; assert_eq!(h.page_type(), PageType::Heap);
+        h.pd_type = 2; assert_eq!(h.page_type(), PageType::BtreeIndex);
+        h.pd_type = 3; assert_eq!(h.page_type(), PageType::Undo);
+        h.pd_type = 4; assert_eq!(h.page_type(), PageType::Fsm);
+        h.pd_type = 5; assert_eq!(h.page_type(), PageType::RecycleQueue);
+        h.pd_type = 99; assert_eq!(h.page_type(), PageType::Unused);
+    }
 }

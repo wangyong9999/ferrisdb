@@ -195,4 +195,21 @@ mod tests {
         raw_csns.dedup();
         assert_eq!(raw_csns.len(), 400);
     }
+
+    #[test]
+    fn test_csn_full_api() {
+        assert!(Csn::INVALID.is_invalid());
+        assert!(!Csn::INVALID.is_valid());
+        assert!(Csn::FIRST_VALID.is_valid());
+        assert!(Csn::FROZEN.is_frozen());
+        let _ = Csn::MAX.is_frozen(); // may or may not be frozen
+        let c = Csn::from_raw(10);
+        assert_eq!(c.next().raw(), 11);
+        assert!(c.precedes(c.next()));
+
+        let alloc = CsnAllocator::new();
+        let _ = alloc.current();
+        alloc.set_current(Csn::from_raw(50));
+        assert_eq!(alloc.current().raw(), 50);
+    }
 }

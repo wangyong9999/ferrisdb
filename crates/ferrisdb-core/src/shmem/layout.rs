@@ -108,7 +108,16 @@ mod tests {
 
     #[test]
     fn test_cache_aligned_size() {
-        // CacheAligned 应该至少有 128 字节对齐
         assert!(mem::align_of::<CacheAligned<u8>>() >= 128);
+    }
+
+    #[test]
+    fn test_cache_aligned_ops() {
+        let mut ca = CacheAligned::new(42u32);
+        assert_eq!(*ca.get(), 42);
+        *ca.get_mut() = 99;
+        assert_eq!(*ca, 99); // Deref
+        *ca = 77;            // DerefMut
+        assert_eq!(*ca.get(), 77);
     }
 }

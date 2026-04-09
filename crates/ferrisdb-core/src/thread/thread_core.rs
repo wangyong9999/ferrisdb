@@ -227,4 +227,21 @@ mod tests {
         assert_eq!(alloc.allocate(), 2);
         assert_eq!(alloc.allocate(), 3);
     }
+
+    #[test]
+    fn test_current_thread_core_lifecycle() {
+        // 初始无 ThreadCore
+        assert!(current_thread_core().is_none());
+
+        let tc = Arc::new(StdThreadCore::new(99));
+        let ptr: *const dyn ThreadCore = Arc::as_ptr(&tc) as *const dyn ThreadCore;
+        unsafe { set_current_thread_core(ptr); }
+
+        let current = current_thread_core();
+        assert!(current.is_some());
+        assert_eq!(current.unwrap().thread_id(), 99);
+
+        clear_current_thread_core();
+        assert!(current_thread_core().is_none());
+    }
 }

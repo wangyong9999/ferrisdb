@@ -644,4 +644,69 @@ mod tests {
         assert_eq!(header.base.page_type(), PageType::Heap);
         assert!(header.base.free_space() > 0);
     }
+
+    #[test]
+    fn test_item_ids_empty() {
+        #[repr(C, align(8192))]
+        struct A { data: [u8; PAGE_SIZE] }
+        let mut a = A { data: [0; PAGE_SIZE] };
+        let page = HeapPage::from_bytes(&mut a.data);
+        page.init();
+        assert!(page.item_ids().is_empty());
+    }
+
+    #[test]
+    fn test_item_ids_after_insert() {
+        #[repr(C, align(8192))]
+        struct A { data: [u8; PAGE_SIZE] }
+        let mut a = A { data: [0; PAGE_SIZE] };
+        let page = HeapPage::from_bytes(&mut a.data);
+        page.init();
+        page.insert_tuple(&[0xABu8; 50]);
+        page.insert_tuple(&[0xCDu8; 60]);
+        let ids = page.item_ids();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn test_prune_dead_tuples() {
+        #[repr(C, align(8192))]
+        struct A { data: [u8; PAGE_SIZE] }
+        let mut a = A { data: [0; PAGE_SIZE] };
+        let page = HeapPage::from_bytes(&mut a.data);
+        page.init();
+
+        // 插入几个元组（模拟 TupleHeader: xmin[8]+xmax[8]+...）
+        // xmax = 0 表示活跃, xmax != 0 表示已删除
+        let mut live = vec![0u8; 50];
+        live[0..8].copy_from_slice(&1u64.to_le_bytes()); // xmin
+        // xmax bytes 8..16 all zero = live
+        page.insert_tuple(&live);
+
+        let mut dead = vec![0u8; 50];
+        dead[0..8].copy_from_slice(&2u64.to_le_bytes()); // xmin
+        dead[8..16].copy_from_slice(&3u64.to_le_bytes()); // xmax != 0 = deleted
+        page.insert_tuple(&dead);
+
+        page.insert_tuple(&live);
+
+        let reclaimed = page.prune_dead_tuples();
+        assert!(reclaimed > 0, "Should reclaim dead tuple space");
+    }
+
+    #[test]
+    fn test_prune_no_dead() {
+        #[repr(C, align(8192))]
+        struct A { data: [u8; PAGE_SIZE] }
+        let mut a = A { data: [0; PAGE_SIZE] };
+        let page = HeapPage::from_bytes(&mut a.data);
+        page.init();
+
+        let mut live = vec![0u8; 40];
+        live[0..8].copy_from_slice(&1u64.to_le_bytes());
+        page.insert_tuple(&live);
+        page.insert_tuple(&live);
+
+        assert_eq!(page.prune_dead_tuples(), 0);
+    }
 }

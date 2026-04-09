@@ -199,4 +199,49 @@ mod tests {
         assert!(!ptr.is_null());
         assert_eq!(ptr.offset(), Offset::from(100));
     }
+
+    #[test]
+    fn test_offset_ptr_as_ptr() {
+        let data: [u32; 4] = [10, 20, 30, 40];
+        let base = data.as_ptr() as *const u8;
+        // offset = 8 bytes = 2nd u32
+        let ptr = OffsetPtr::<u32>::from_offset(Offset::from(8));
+        let result = unsafe { *ptr.as_ptr(base) };
+        assert_eq!(result, 30);
+
+        // Null pointer
+        let null_ptr = OffsetPtr::<u32>::null();
+        let p = unsafe { null_ptr.as_ptr(base) };
+        assert!(p.is_null());
+    }
+
+    #[test]
+    fn test_offset_ptr_as_mut_ptr() {
+        let mut data: [u32; 4] = [10, 20, 30, 40];
+        let base = data.as_mut_ptr() as *mut u8;
+        let ptr = OffsetPtr::<u32>::from_offset(Offset::from(4));
+        unsafe { *ptr.as_mut_ptr(base) = 99; }
+        assert_eq!(data[1], 99);
+    }
+
+    #[test]
+    fn test_offset_ptr_clone_eq_default() {
+        let p1 = OffsetPtr::<u32>::from_offset(Offset::from(42));
+        let p2 = p1.clone();
+        assert_eq!(p1, p2);
+
+        let p3: OffsetPtr<u32> = Default::default();
+        assert!(p3.is_null());
+        assert_ne!(p1, p3);
+    }
+
+    #[test]
+    fn test_offset_default_and_into() {
+        let o: Offset = Default::default();
+        assert!(o.is_null());
+
+        let o2 = Offset::from(42);
+        let raw: u64 = o2.into();
+        assert_eq!(raw, 42);
+    }
 }

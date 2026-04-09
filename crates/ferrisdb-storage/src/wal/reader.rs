@@ -182,4 +182,29 @@ mod tests {
         // 尝试打开不存在的文件应该失败
         assert!(reader.open(999).is_err());
     }
+
+    #[test]
+    fn test_reader_lifecycle() {
+        let td = TempDir::new().unwrap();
+        let writer = crate::wal::WalWriter::new(td.path());
+        writer.write(&[0xAB; 50]).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let mut reader = WalReader::new(td.path());
+        reader.open(0).unwrap();
+        assert!(!reader.is_eof());
+        let _ = reader.current_lsn();
+        let _ = reader.offset();
+        while let Ok(Some(_)) = reader.read_next() {}
+        reader.close();
+    }
+
+    #[test]
+    fn test_reader_seek_and_errors() {
+        let td = TempDir::new().unwrap();
+        let mut reader = WalReader::new(td.path());
+        assert!(reader.seek(100).is_err());
+        assert!(reader.read_next().is_err());
+    }
 }

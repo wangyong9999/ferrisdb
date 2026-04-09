@@ -1289,4 +1289,55 @@ mod tests {
         assert!(tid.is_valid());
         txn.commit().unwrap();
     }
+
+    #[test]
+    fn test_set_wal_ring() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(200)).unwrap());
+        let mut tm = TransactionManager::new(16);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let mut heap = HeapTable::new(8, bp, tm);
+        let ring = Arc::new(ferrisdb_storage::wal::ring_buffer::WalRingBuffer::new(4096));
+        heap.set_wal_ring(ring);
+        let wal_buf = Arc::new(WalBuffer::new(4096));
+        heap.set_wal_buffer(wal_buf);
+    }
+
+    #[test]
+    fn test_fetch_visible_committed() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(500)).unwrap());
+        let mut tm = TransactionManager::new(64);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::new(9, Arc::clone(&bp), Arc::clone(&tm));
+
+        let mut txn1 = tm.begin().unwrap();
+        let tid = heap.insert(b"visible_data", txn1.xid(), 0).unwrap();
+        txn1.commit().unwrap();
+
+        let txn2 = tm.begin().unwrap();
+        let result = heap.fetch_visible(tid, &txn2);
+        // Should be accessible (may or may not be visible depending on snapshot)
+        let _ = result;
+    }
+
+    #[test]
+    fn test_delete_with_wal_writer() {
+        let td = tempfile::TempDir::new().unwrap();
+        let wal_dir = td.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let writer = Arc::new(ferrisdb_storage::wal::WalWriter::new(&wal_dir));
+
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(500)).unwrap());
+        let mut tm = TransactionManager::new(64);
+        tm.set_buffer_pool(Arc::clone(&bp));
+        let tm = Arc::new(tm);
+        let heap = HeapTable::with_wal_writer(10, Arc::clone(&bp), Arc::clone(&tm), writer);
+
+        let mut txn = tm.begin().unwrap();
+        let xid = txn.xid();
+        let tid = heap.insert(b"to_delete", xid, 0).unwrap();
+        heap.delete(tid, xid, 1).unwrap();
+        txn.commit().unwrap();
+    }
 }

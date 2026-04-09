@@ -673,4 +673,26 @@ mod tests {
         assert_eq!(cfg.shared_buffers, 50000);
         assert!(cfg.wal_enabled);
     }
+
+    #[test]
+    fn test_engine_save_load_index_free_pages() {
+        let td = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(EngineConfig {
+            data_dir: td.path().to_path_buf(),
+            shared_buffers: 100,
+            wal_enabled: false,
+            ..Default::default()
+        }).unwrap();
+        engine.create_table("fp_table").unwrap();
+        engine.create_index("fp_idx", "fp_table").unwrap();
+        let idx = engine.open_index("fp_idx").unwrap();
+        idx.set_free_pages(vec![10, 20, 30]);
+        engine.save_index_state("fp_idx", &idx).unwrap();
+
+        let idx2 = engine.open_index("fp_idx").unwrap();
+        engine.restore_index_free_pages("fp_idx", &idx2);
+        let pages = idx2.get_free_pages();
+        assert_eq!(pages, vec![10, 20, 30]);
+        engine.shutdown().unwrap();
+    }
 }

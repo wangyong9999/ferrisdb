@@ -436,4 +436,18 @@ mod tests {
         let new_page2 = smgr.extend(&tag).unwrap();
         assert_eq!(new_page2, 1);
     }
+
+    #[test]
+    fn test_sync_and_num_pages() {
+        let temp_dir = TempDir::new().unwrap();
+        let smgr = StorageManager::new(temp_dir.path());
+        smgr.init().unwrap();
+
+        let tag = BufferTag::new(PdbId::new(0), 1, 0);
+        smgr.write_page(&tag, &vec![0u8; crate::page::PAGE_SIZE]).unwrap();
+        smgr.sync(&tag).unwrap();
+
+        let pages = smgr.num_pages(&tag).unwrap();
+        assert!(pages >= 1);
+    }
 }

@@ -571,4 +571,12 @@ mod tests {
         let file_path = writer.get_file_path(1);
         assert!(file_path.exists());
     }
+
+    #[test]
+    fn test_wal_writer_close() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let writer = WalWriter::new(temp_dir.path());
+        writer.write(&[1u8; 50]).unwrap();
+        writer.close().unwrap();
+    }
 }

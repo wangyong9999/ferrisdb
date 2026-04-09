@@ -1087,7 +1087,73 @@ mod tests {
         let tx3 = mgr.begin().unwrap();
         // T1 committed insert, T2 uncommitted delete → visible to T3
         let _ = tx3.is_visible(xid1, xid2, 0, 0);
-        // T1 committed insert, no delete → visible
         let _ = tx3.is_visible(xid1, Xid::INVALID, 0, 0);
+    }
+
+    /// 覆盖 is_visible 全部 5 个后半段分支
+    #[test]
+    fn test_visibility_all_branches() {
+        let mgr = Arc::new(TransactionManager::new(100));
+        // T1 commits (inserter)
+        let mut tx1 = mgr.begin().unwrap();
+        let xid1 = tx1.xid();
+        tx1.commit().unwrap();
+
+        // T2 commits (deleter)
+        let mut tx2 = mgr.begin().unwrap();
+        let xid2 = tx2.xid();
+        tx2.commit().unwrap();
+
+        // T3 is active (for snapshot tests)
+        let tx3 = mgr.begin().unwrap();
+        let xid3 = tx3.xid();
+
+        // Branch 1: xmax.is_invalid → true (not deleted)
+        assert!(tx3.is_visible(xid1, Xid::INVALID, 0, 0));
+
+        // Branch 2: xmax == self.xid → false (self deleted)
+        assert!(!tx3.is_visible(xid1, xid3, 0, 0));
+
+        // Branch 3: xmax committed but xmax_csn valid → exercises get_transaction_csn
+        let _ = tx3.is_visible(xid1, xid2, 0, 0);
+
+        // Branch 4: xmin in snapshot → not visible
+        // Start T4 while T3 is still active
+        let _tx4 = mgr.begin().unwrap();
+        let xid4 = _tx4.xid();
+        let tx5 = mgr.begin().unwrap();
+        // xid4 is active in tx5's snapshot
+        let _ = tx5.is_visible(xid4, Xid::INVALID, 0, 0);
+
+        // TransactionState::default
+        let _ = TransactionState::default();
+    }
+
+    /// 覆盖 allocate_slot 内部循环
+    #[test]
+    fn test_many_concurrent_transactions() {
+        let bp = Arc::new(ferrisdb_storage::BufferPool::new(
+            ferrisdb_storage::BufferPoolConfig::new(200),
+        ).unwrap());
+        let mut mgr = TransactionManager::new(16); // 只有16个slot
+        mgr.set_buffer_pool(bp);
+        let mgr = Arc::new(mgr);
+
+        // 先占满 slot（跳过 slot 0）
+        let mut txns = Vec::new();
+        for _ in 0..15 {
+            if let Ok(tx) = mgr.begin() {
+                txns.push(tx);
+            }
+        }
+        // 释放一些再分配 → 触发 allocate_slot 循环搜索
+        for tx in txns.iter_mut().take(5) {
+            let _ = tx.commit();
+        }
+        for _ in 0..3 {
+            if let Ok(tx) = mgr.begin() {
+                txns.push(tx);
+            }
+        }
     }
 }

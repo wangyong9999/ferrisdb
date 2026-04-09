@@ -810,6 +810,33 @@ mod tests {
         assert_eq!(lock.load_low32(), 0);
     }
 
+    #[test]
+    fn test_try_acquire_both_modes() {
+        let lock = LWLock::new();
+        assert!(lock.try_acquire(LockMode::Shared));
+        lock.release(LockMode::Shared);
+        assert!(lock.try_acquire(LockMode::Exclusive));
+        lock.release(LockMode::Exclusive);
+    }
+
+    #[test]
+    fn test_lock_guard_try_new_fail() {
+        let lock = LWLock::new();
+        lock.acquire(LockMode::Exclusive);
+        let guard = LockGuard::try_new(&lock, LockMode::Shared);
+        assert!(guard.is_none());
+        lock.release(LockMode::Exclusive);
+        let guard2 = LockGuard::try_new(&lock, LockMode::Exclusive);
+        assert!(guard2.is_some());
+    }
+
+    #[test]
+    fn test_lwlock_default_has_waiters() {
+        let lock: LWLock = Default::default();
+        assert!(!lock.has_waiters());
+        assert!(!lock.is_locked());
+    }
+
 }
 
 // ========== loom 并发测试 ==========

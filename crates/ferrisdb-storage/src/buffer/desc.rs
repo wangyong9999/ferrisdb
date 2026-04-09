@@ -504,4 +504,24 @@ mod tests {
         assert_eq!(std::mem::size_of::<CRInfoCr>(), 24);
         assert_eq!(std::mem::size_of::<CRInfo>(), 24);
     }
+
+    #[test]
+    fn test_buf_state_accessors() {
+        let s = BufState::new();
+        assert!(!s.is_valid());
+        assert!(!s.is_io_in_progress());
+        assert!(!s.is_checkpoint_needed());
+        let s2: BufState = Default::default();
+        let _ = s2;
+    }
+
+    #[test]
+    fn test_buffer_desc_accessors() {
+        let desc = BufferDesc::new(0);
+        assert!(!desc.is_valid());
+        let _ = desc.page_data();
+        desc.pin();
+        assert!(desc.is_pinned());
+        desc.unpin();
+    }
 }

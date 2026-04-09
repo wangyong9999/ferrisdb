@@ -1472,4 +1472,26 @@ mod tests {
         // Cursor should find most keys (may miss some due to split timing)
         assert!(count >= 450, "Expected >=450, got {}", count);
     }
+
+    #[test]
+    fn test_index_oid() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(100)).unwrap());
+        let tree = BTree::new(7777, bp);
+        assert_eq!(tree.index_oid(), 7777);
+    }
+
+    #[test]
+    fn test_binary_search_all_branches() {
+        let bp = Arc::new(BufferPool::new(BufferPoolConfig::new(200)).unwrap());
+        let tree = BTree::new(7778, bp);
+        tree.init().unwrap();
+        for i in 0..20u32 {
+            tree.insert(BTreeKey::new(format!("{:04}", i).into_bytes()),
+                BTreeValue::Tuple { block: i, offset: 0 }).unwrap();
+        }
+        assert!(tree.lookup(&BTreeKey::new(b"0010".to_vec())).unwrap().is_some());
+        assert!(tree.lookup(&BTreeKey::new(b"0019".to_vec())).unwrap().is_some());
+        assert!(tree.lookup(&BTreeKey::new(b"0000".to_vec())).unwrap().is_some());
+        tree.delete(&BTreeKey::new(b"0005".to_vec())).unwrap();
+    }
 }

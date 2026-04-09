@@ -98,7 +98,7 @@ impl LruQueue {
     /// - nodes 数组必须包含有效的 LruNode
     /// - node_idx 必须是有效的索引
     /// - 调用者必须持有 lock
-    pub unsafe fn add_to_head(&self, nodes: &[super::desc::LruNodeData], node_idx: u32) {
+    pub unsafe fn add_to_head(&self, nodes: &[crate::buffer::desc::LruNodeData], node_idx: u32) {
         let node = &nodes[node_idx as usize];
         node.prev.store(u32::MAX, Ordering::Relaxed);
         node.next.store(self.head.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -123,7 +123,7 @@ impl LruQueue {
     /// - nodes 数组必须包含有效的 LruNode
     /// - node_idx 必须是有效的索引
     /// - 调用者必须持有 lock
-    pub unsafe fn remove(&self, nodes: &[super::desc::LruNodeData], node_idx: u32) {
+    pub unsafe fn remove(&self, nodes: &[crate::buffer::desc::LruNodeData], node_idx: u32) {
         let node = &nodes[node_idx as usize];
         let prev_idx = node.prev.load(Ordering::Acquire);
         let next_idx = node.next.load(Ordering::Acquire);
@@ -155,7 +155,7 @@ impl LruQueue {
     /// - nodes 数组必须包含有效的 LruNode
     /// - node_idx 必须是有效的索引且在队列中
     /// - 调用者必须持有 lock
-    pub unsafe fn move_to_head(&self, nodes: &[super::desc::LruNodeData], node_idx: u32) {
+    pub unsafe fn move_to_head(&self, nodes: &[crate::buffer::desc::LruNodeData], node_idx: u32) {
         // SAFETY: Caller ensures all safety requirements
         unsafe {
             // 先移除
@@ -211,5 +211,65 @@ mod tests {
         let node = LruNode::new();
         assert_eq!(node.prev.load(Ordering::Relaxed), u32::MAX);
         assert_eq!(node.next.load(Ordering::Relaxed), u32::MAX);
+    }
+
+    #[test]
+    fn test_lru_queue_add_remove() {
+        let queue = LruQueue::new(0);
+        let nodes: Vec<crate::buffer::desc::LruNodeData> = (0..5)
+            .map(|_| crate::buffer::desc::LruNodeData::default())
+            .collect();
+        let _guard = queue.lock();
+
+        unsafe {
+            queue.add_to_head(&nodes, 0);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue.head(), 0);
+            assert_eq!(queue.tail(), 0);
+
+            queue.add_to_head(&nodes, 1);
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue.head(), 1);
+            assert_eq!(queue.tail(), 0);
+
+            queue.add_to_head(&nodes, 2);
+            assert_eq!(queue.len(), 3);
+
+            // Remove middle node (1)
+            queue.remove(&nodes, 1);
+            assert_eq!(queue.len(), 2);
+
+            // Remove head (2)
+            queue.remove(&nodes, 2);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue.head(), 0);
+
+            // Remove last (0)
+            queue.remove(&nodes, 0);
+            assert!(queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_lru_queue_move_to_head() {
+        let queue = LruQueue::new(0);
+        let nodes: Vec<crate::buffer::desc::LruNodeData> = (0..3)
+            .map(|_| crate::buffer::desc::LruNodeData::default())
+            .collect();
+        let _guard = queue.lock();
+
+        unsafe {
+            queue.add_to_head(&nodes, 0);
+            queue.add_to_head(&nodes, 1);
+            queue.add_to_head(&nodes, 2);
+            // Order: 2 → 1 → 0
+            assert_eq!(queue.head(), 2);
+            assert_eq!(queue.tail(), 0);
+
+            // Move tail (0) to head
+            queue.move_to_head(&nodes, 0);
+            assert_eq!(queue.head(), 0);
+            assert_eq!(queue.len(), 3);
+        }
     }
 }

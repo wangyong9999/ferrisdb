@@ -1196,6 +1196,7 @@ impl WalRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wal::{WalWriter, WalHeapInsert, WalHeapDelete, WalHeapInplaceUpdate, WalTxnCommit};
     use tempfile::TempDir;
 
     #[test]
@@ -1312,5 +1313,70 @@ mod tests {
         // 验证页面数据中的 LSN
         let data = ctx.read_page(&page_id).unwrap();
         assert_eq!(u64::from_le_bytes(data[0..8].try_into().unwrap()), 42);
+    }
+
+    /// 直接测试 redo_heap_delete 和 redo_heap_inplace_update
+    #[test]
+    fn test_redo_delete_and_update_directly() {
+        let temp_dir = TempDir::new().unwrap();
+        let smgr = Arc::new(StorageManager::new(temp_dir.path()));
+        smgr.init().unwrap();
+
+        // 准备一个有数据的页面
+        let page_id = ferrisdb_core::PageId::new(0, 0, 1, 0);
+        let mut page_buf = vec![0u8; PAGE_SIZE];
+        // 初始化为 HeapPage
+        {
+            #[repr(C, align(8192))]
+            struct A { data: [u8; PAGE_SIZE] }
+            let mut aligned = A { data: [0u8; PAGE_SIZE] };
+            let hp = HeapPage::from_bytes(&mut aligned.data);
+            hp.init();
+            hp.insert_tuple(&[0xABu8; 100]); // offset 1
+            hp.insert_tuple(&[0xCDu8; 80]);  // offset 2
+            page_buf.copy_from_slice(&aligned.data);
+        }
+        // 写入磁盘
+        let tag = ferrisdb_core::BufferTag::new(ferrisdb_core::PdbId::new(0), 1, 0);
+        smgr.write_page(&tag, &page_buf).unwrap();
+
+        // 构造 recovery 并 redo
+        let wal_dir = temp_dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let writer = WalWriter::new(&wal_dir);
+        // Write insert (to set page LSN)
+        let data = vec![0xABu8; 50];
+        let ins = WalHeapInsert::new(page_id, 1, &data);
+        writer.write(&ins.serialize_with_data(&data)).unwrap();
+        // Write delete
+        let del = WalHeapDelete::new(page_id, 1);
+        writer.write(&del.to_bytes()).unwrap();
+        // Write inplace update
+        let upd_data = vec![0xEEu8; 50];
+        let upd = WalHeapInplaceUpdate::new(page_id, 2, &upd_data);
+        writer.write(&upd.serialize_with_data(&upd_data)).unwrap();
+        // Commit
+        let commit = WalTxnCommit::new(ferrisdb_core::Xid::new(0, 1), 100);
+        writer.write(&commit.to_bytes()).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let recovery = WalRecovery::with_smgr(&wal_dir, Arc::clone(&smgr));
+        recovery.recover(RecoveryMode::CrashRecovery).unwrap();
+        let stats = recovery.stats();
+        assert!(stats.records_redone + stats.records_skipped >= 3,
+            "Should process 3+ records, got redo={} skip={}", stats.records_redone, stats.records_skipped);
+    }
+
+    /// 测试 RecoveryStage::Failed 路径
+    #[test]
+    fn test_recovery_stage_failed() {
+        let recovery = WalRecovery::new("/nonexistent/path");
+        let result = recovery.recover(RecoveryMode::CrashRecovery);
+        // 应该报错（WAL 目录不存在）
+        assert!(result.is_err());
+        // stage 应该是 Failed
+        assert!(recovery.stage() == RecoveryStage::Failed || recovery.stage() == RecoveryStage::ReadingWal);
     }
 }

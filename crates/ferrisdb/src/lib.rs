@@ -34,6 +34,11 @@ pub use ferrisdb_core::{FerrisDBError, Result, Xid, Csn, Lsn};
 pub use ferrisdb_core::config;
 pub use ferrisdb_core::stats;
 pub use ferrisdb_storage::{BTree, BTreeKey, BTreeValue};
+pub use ferrisdb_storage::catalog::{DataType, ColumnDef, RelationMeta};
+pub use ferrisdb_storage::row_codec::{Value, encode_row, decode_row};
+pub use ferrisdb_storage::{BufferPool, BufferPoolConfig, StorageManager};
+pub use ferrisdb_storage::{WalWriter, WalBuffer};
+pub use ferrisdb_storage::wal;
 pub use ferrisdb_transaction::{
     Transaction, TransactionManager, TransactionState,
     HeapTable, HeapScan, TupleId, TupleHeader,

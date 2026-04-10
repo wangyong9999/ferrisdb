@@ -1632,9 +1632,7 @@ name = "ferrisdb-bench"
 version = "0.1.0"
 dependencies = [
  "clap",
- "ferrisdb-core",
- "ferrisdb-storage",
- "ferrisdb-transaction",
+ "ferrisdb",
  "parking_lot",
  "rand 0.8.5",
  "tempfile",
@@ -1669,9 +1667,6 @@ dependencies = [
  "async-trait",
  "datafusion",
  "ferrisdb",
- "ferrisdb-core",
- "ferrisdb-storage",
- "ferrisdb-transaction",
  "futures",
  "pgwire",
  "sqllogictest",

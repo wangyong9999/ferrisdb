@@ -7,9 +7,8 @@
 //! in-memory HashMap indexes for key lookups, and typed tuple serialization.
 
 use clap::Parser;
-use ferrisdb_core::Xid;
-use ferrisdb_storage::{BTree, BTreeKey, BTreeValue, BufferPool, BufferPoolConfig, StorageManager};
-use ferrisdb_transaction::{HeapTable, TransactionManager, TupleId};
+use ferrisdb::{Xid, BTree, BTreeKey, BTreeValue, BufferPool, BufferPoolConfig, StorageManager};
+use ferrisdb::{HeapTable, TransactionManager, TupleId};
 use rand::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -363,7 +362,7 @@ struct TpccTables {
 }
 
 impl TpccTables {
-    fn new(buffer_pool: Arc<BufferPool>, txn_mgr: Arc<TransactionManager>, customer_per_district: u32, wal_writer: Option<Arc<ferrisdb_storage::WalWriter>>, wal_ring: Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>>) -> Self {
+    fn new(buffer_pool: Arc<BufferPool>, txn_mgr: Arc<TransactionManager>, customer_per_district: u32, wal_writer: Option<Arc<ferrisdb::WalWriter>>, wal_ring: Option<Arc<ferrisdb::wal::ring_buffer::WalRingBuffer>>) -> Self {
         let bp = &buffer_pool;
         let tm = &txn_mgr;
         let make_table = |oid: u32| -> Arc<HeapTable> {
@@ -404,7 +403,7 @@ impl TpccTables {
 
     /// 启用所有表的 WalBuffer 快速路径（数据加载完成后调用）
     /// 获取 WAL Ring Buffer 引用（第一个表的 ring）
-    fn get_wal_ring(&self) -> Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>> {
+    fn get_wal_ring(&self) -> Option<Arc<ferrisdb::wal::ring_buffer::WalRingBuffer>> {
         // 所有表共享同一个 ring，从 warehouse 获取
         None // Ring 存在 TpccTables 外部，由 caller 管理
     }
@@ -840,7 +839,7 @@ fn execute_new_order<R: Rng>(
     rng: &mut R,
     num_warehouses: u32,
     item_num: u32,
-) -> ferrisdb_core::Result<bool> {
+) -> ferrisdb::Result<bool> {
     let mut txn = txn_mgr.begin()?;
     let xid = txn.xid();
 
@@ -1163,7 +1162,7 @@ fn execute_payment<R: Rng>(
     txn_mgr: &Arc<TransactionManager>,
     rng: &mut R,
     num_warehouses: u32,
-) -> ferrisdb_core::Result<bool> {
+) -> ferrisdb::Result<bool> {
     let mut txn = txn_mgr.begin()?;
     let xid = txn.xid();
 
@@ -1377,7 +1376,7 @@ fn execute_order_status<R: Rng>(
     txn_mgr: &Arc<TransactionManager>,
     rng: &mut R,
     num_warehouses: u32,
-) -> ferrisdb_core::Result<bool> {
+) -> ferrisdb::Result<bool> {
     let mut txn = txn_mgr.begin()?;
 
     let w_id = random_number(rng, 1, num_warehouses as i32);
@@ -1448,7 +1447,7 @@ fn execute_delivery<R: Rng>(
     txn_mgr: &Arc<TransactionManager>,
     rng: &mut R,
     num_warehouses: u32,
-) -> ferrisdb_core::Result<bool> {
+) -> ferrisdb::Result<bool> {
     let mut txn = txn_mgr.begin()?;
     let xid = txn.xid();
 
@@ -1634,7 +1633,7 @@ fn execute_stock_level<R: Rng>(
     txn_mgr: &Arc<TransactionManager>,
     rng: &mut R,
     num_warehouses: u32,
-) -> ferrisdb_core::Result<bool> {
+) -> ferrisdb::Result<bool> {
     let mut txn = txn_mgr.begin()?;
 
     let w_id = random_number(rng, 1, num_warehouses as i32);
@@ -1838,7 +1837,7 @@ fn main() {
         let wal_dir = data_dir.join("wal");
         std::fs::create_dir_all(&wal_dir).expect("Failed to create WAL directory");
         println!("WAL enabled: {}", wal_dir.display());
-        Some(Arc::new(ferrisdb_storage::WalWriter::new(&wal_dir)))
+        Some(Arc::new(ferrisdb::WalWriter::new(&wal_dir)))
     } else {
         None
     };
@@ -1846,8 +1845,8 @@ fn main() {
     let _wal_flusher = wal_writer.as_ref().map(|w| w.start_flusher(5));
 
     // WAL Ring Buffer（16MB 环形，后台 drain 到 WalWriter）
-    let wal_ring_ref: Option<Arc<ferrisdb_storage::wal::ring_buffer::WalRingBuffer>> = if wal_writer.is_some() {
-        Some(Arc::new(ferrisdb_storage::wal::ring_buffer::WalRingBuffer::new(16 * 1024 * 1024)))
+    let wal_ring_ref: Option<Arc<ferrisdb::wal::ring_buffer::WalRingBuffer>> = if wal_writer.is_some() {
+        Some(Arc::new(ferrisdb::wal::ring_buffer::WalRingBuffer::new(16 * 1024 * 1024)))
     } else {
         None
     };
@@ -1895,7 +1894,7 @@ fn main() {
     // 数据加载完成后启用 WAL + 启动 drain 线程
     let _wal_drain = if let (Some(ref ring), Some(ref w)) = (&wal_ring_ref, &wal_writer) {
         tables.enable_wal();
-        Some(ferrisdb_storage::wal::ring_buffer::start_drain_thread(
+        Some(ferrisdb::wal::ring_buffer::start_drain_thread(
             Arc::clone(ring), Arc::clone(w), 5,
         ))
     } else {

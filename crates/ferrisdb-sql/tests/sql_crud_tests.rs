@@ -5,8 +5,8 @@
 use std::sync::Arc;
 use tempfile::TempDir;
 use ferrisdb::{Engine, EngineConfig};
-use ferrisdb_storage::catalog::{ColumnDef, DataType};
-use ferrisdb_storage::row_codec::{encode_row, Value};
+use ferrisdb::{ColumnDef, DataType};
+use ferrisdb::{encode_row, Value};
 use ferrisdb_sql::session::create_session;
 
 fn make_engine(td: &TempDir) -> Arc<Engine> {

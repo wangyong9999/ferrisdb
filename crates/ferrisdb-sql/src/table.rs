@@ -18,8 +18,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::memory::MemoryExec;
 
 use ferrisdb::Engine;
-use ferrisdb_storage::catalog::RelationMeta;
-use ferrisdb_storage::row_codec::{decode_row, Value};
+use ferrisdb::{RelationMeta, decode_row, Value};
 
 use crate::row_to_arrow;
 
@@ -71,7 +70,7 @@ impl TableProvider for FerrisTable {
         let engine = Arc::clone(&self.engine);
         let table_name = self.meta.name.clone();
         let columns = self.meta.columns.clone();
-        let col_types: Vec<ferrisdb_storage::catalog::DataType> =
+        let col_types: Vec<ferrisdb::DataType> =
             columns.iter().map(|c| c.data_type).collect();
         let scan_limit = limit;
 
@@ -88,7 +87,7 @@ impl TableProvider for FerrisTable {
             };
 
             let mut result = Vec::new();
-            let mut scan = ferrisdb_transaction::HeapScan::new(&table);
+            let mut scan = ferrisdb::HeapScan::new(&table);
             while let Ok(Some((_tid, _hdr, data))) = scan.next() {
                 let payload = if data.len() > 32 { &data[32..] } else { &data };
                 if let Some(vals) = decode_row(&col_types, payload) {

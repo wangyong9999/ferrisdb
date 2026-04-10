@@ -3,8 +3,8 @@
 use arrow::array::*;
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use ferrisdb_storage::catalog::{ColumnDef, DataType};
-use ferrisdb_storage::row_codec::Value;
+use ferrisdb::{ColumnDef, DataType};
+use ferrisdb::Value;
 use std::sync::Arc;
 
 /// FerrisDB DataType → Arrow DataType

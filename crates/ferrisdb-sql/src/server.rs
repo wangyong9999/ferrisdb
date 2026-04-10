@@ -22,8 +22,8 @@ use arrow::array::*;
 use arrow::datatypes::DataType as ArrowDataType;
 
 use ferrisdb::Engine;
-use ferrisdb_storage::catalog::{ColumnDef, DataType};
-use ferrisdb_storage::row_codec::{encode_row, Value};
+use ferrisdb::{ColumnDef, DataType};
+use ferrisdb::{encode_row, Value};
 
 use crate::session::create_session;
 
@@ -231,22 +231,10 @@ impl FerrisQueryHandler {
             columns.push(ColumnDef::new(&col_name, col_type, nullable, pos as u16));
         }
 
-        // 在 FerrisDB 中创建表
-        self.engine.create_table(&table_name).map_err(|e| {
+        // 使用 Engine 高层 API 一步建表
+        self.engine.create_table_with_columns(&table_name, columns).map_err(|e| {
             PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
                 "ERROR".to_owned(), "42P07".to_owned(), format!("{}", e),
-            )))
-        })?;
-
-        // 更新 catalog 加 Schema（先 drop 无 schema 版本再重建）
-        self.engine.drop_table(&table_name).map_err(|e| {
-            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-                "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
-            )))
-        })?;
-        self.engine.catalog().create_table_with_schema(&table_name, 0, columns).map_err(|e| {
-            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-                "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
             )))
         })?;
 
@@ -270,67 +258,30 @@ impl FerrisQueryHandler {
         let table_name = rest[..values_pos].trim().to_lowercase();
         let values_str = rest[values_pos+6..].trim();
 
-        // 查表 Schema
-        let meta = self.engine.catalog().lookup_by_name(&table_name).ok_or_else(|| {
+        // 查表列类型
+        let col_types = self.engine.table_column_types(&table_name).map_err(|e| {
             PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-                "ERROR".to_owned(), "42P01".to_owned(),
-                format!("Table '{}' not found", table_name),
+                "ERROR".to_owned(), "42P01".to_owned(), format!("{}", e),
             )))
         })?;
 
-        let col_types: Vec<DataType> = meta.columns.iter().map(|c| c.data_type).collect();
-
         // 解析值列表: (v1, v2, ...) 可能有多行
-        let mut inserted = 0usize;
+        let mut rows = Vec::new();
         for row_str in values_str.split("),(") {
             let cleaned = row_str.trim_matches(|c| c == '(' || c == ')' || c == ' ');
             let values: Vec<Value> = cleaned.split(',')
                 .zip(col_types.iter())
-                .map(|(val_str, dt)| {
-                    let v = val_str.trim().trim_matches('\'');
-                    if v.to_uppercase() == "NULL" {
-                        return Value::Null;
-                    }
-                    match dt {
-                        DataType::Int32 => v.parse::<i32>().map(Value::Int32).unwrap_or(Value::Null),
-                        DataType::Int64 => v.parse::<i64>().map(Value::Int64).unwrap_or(Value::Null),
-                        DataType::Float64 => v.parse::<f64>().map(Value::Float64).unwrap_or(Value::Null),
-                        DataType::Text => Value::Text(v.to_string()),
-                        DataType::Boolean => Value::Boolean(v.to_uppercase() == "TRUE" || v == "1"),
-                        DataType::Bytes => Value::Bytes(v.as_bytes().to_vec()),
-                        DataType::Timestamp => v.parse::<i64>().map(Value::Timestamp).unwrap_or(Value::Null),
-                        DataType::Date => v.parse::<i32>().map(Value::Date).unwrap_or(Value::Null),
-                        DataType::Float32 => v.parse::<f32>().map(Value::Float32).unwrap_or(Value::Null),
-                        DataType::Int16 => v.parse::<i16>().map(Value::Int16).unwrap_or(Value::Null),
-                    }
-                })
+                .map(|(val_str, dt)| parse_value(dt, val_str.trim().trim_matches('\'')))
                 .collect();
-
-            let encoded = encode_row(&col_types, &values);
-
-            // 使用 Engine 事务插入
-            let table = self.engine.open_table(&table_name).map_err(|e| {
-                PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-                    "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
-                )))
-            })?;
-            let mut txn = self.engine.begin().map_err(|e| {
-                PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-                    "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
-                )))
-            })?;
-            table.insert(&encoded, txn.xid(), 0).map_err(|e| {
-                PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-                    "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
-                )))
-            })?;
-            txn.commit().map_err(|e| {
-                PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-                    "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
-                )))
-            })?;
-            inserted += 1;
+            rows.push(values);
         }
+
+        // 使用 Engine 高层 API 批量插入
+        let inserted = self.engine.insert_rows(&table_name, &rows).map_err(|e| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
+            )))
+        })?;
 
         Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(inserted))])
     }
@@ -371,7 +322,7 @@ impl FerrisQueryHandler {
         })?;
         let xid = txn.xid();
 
-        let mut scan = ferrisdb_transaction::HeapScan::new(&table);
+        let mut scan = ferrisdb::HeapScan::new(&table);
         let mut tids = Vec::new();
         while let Ok(Some((tid, _hdr, _data))) = scan.next() {
             tids.push(tid);
@@ -444,11 +395,11 @@ impl FerrisQueryHandler {
         let xid = txn.xid();
 
         // 扫描所有行，修改后 update
-        let mut scan = ferrisdb_transaction::HeapScan::new(&table);
+        let mut scan = ferrisdb::HeapScan::new(&table);
         let mut rows_to_update = Vec::new();
         while let Ok(Some((tid, _hdr, data))) = scan.next() {
             let payload = if data.len() > 32 { &data[32..] } else { &data };
-            if let Some(mut vals) = ferrisdb_storage::row_codec::decode_row(&col_types, payload) {
+            if let Some(mut vals) = ferrisdb::decode_row(&col_types, payload) {
                 // 应用 SET 更新
                 for (col_name, new_val) in &updates {
                     if let Some(pos) = meta.columns.iter().position(|c| c.name == *col_name) {

@@ -582,6 +582,92 @@ impl Engine {
             let _ = w.write(&buf);
         }
     }
+
+    // ==================== 高层 API ====================
+    // 以下方法封装了底层 encode/decode/HeapScan 等细节，
+    // 供 SQL 层和外部消费者使用，无需接触存储内部实现。
+
+    /// 创建带列定义的表（一步到位，替代 create_table + drop + create_table_with_schema 的 workaround）
+    pub fn create_table_with_columns(&self, name: &str, columns: Vec<ferrisdb_storage::catalog::ColumnDef>) -> Result<u32> {
+        // 先创建表获取 OID（建立底层 heap 文件）
+        let oid = self.create_table(name)?;
+        // 删除无 schema 版本，用 create_table_with_schema 重建带列定义的版本
+        self.catalog.drop_relation(oid)?;
+        self.catalog.create_table_with_schema(name, 0, columns)?;
+        Ok(oid)
+    }
+
+    /// 插入一行数据（自动 encode + 开事务 + commit + save state）
+    ///
+    /// 适用于单行/少量行的简单 INSERT。批量插入应使用 `insert_rows`。
+    pub fn insert_row(&self, table_name: &str, values: &[ferrisdb_storage::row_codec::Value]) -> Result<()> {
+        let meta = self.catalog.lookup_by_name(table_name).ok_or_else(|| {
+            FerrisDBError::Internal(format!("Table '{}' not found", table_name))
+        })?;
+        let col_types: Vec<ferrisdb_storage::catalog::DataType> =
+            meta.columns.iter().map(|c| c.data_type).collect();
+        let encoded = ferrisdb_storage::row_codec::encode_row(&col_types, values);
+
+        let table = self.open_table(table_name)?;
+        let mut txn = self.begin()?;
+        table.insert(&encoded, txn.xid(), 0)?;
+        txn.commit()?;
+        self.save_table_state(table_name, &table)?;
+        Ok(())
+    }
+
+    /// 批量插入多行数据（共享同一个 HeapTable 实例，避免 open/save 循环的可见性问题）
+    pub fn insert_rows(&self, table_name: &str, rows: &[Vec<ferrisdb_storage::row_codec::Value>]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let meta = self.catalog.lookup_by_name(table_name).ok_or_else(|| {
+            FerrisDBError::Internal(format!("Table '{}' not found", table_name))
+        })?;
+        let col_types: Vec<ferrisdb_storage::catalog::DataType> =
+            meta.columns.iter().map(|c| c.data_type).collect();
+
+        let table = self.open_table(table_name)?;
+        let mut txn = self.begin()?;
+        for (i, row) in rows.iter().enumerate() {
+            let encoded = ferrisdb_storage::row_codec::encode_row(&col_types, row);
+            table.insert(&encoded, txn.xid(), i as u32)?;
+        }
+        txn.commit()?;
+        self.save_table_state(table_name, &table)?;
+        Ok(rows.len())
+    }
+
+    /// 全表扫描，返回解码后的行数据
+    ///
+    /// 每行是 `Vec<Value>`，列顺序与 catalog 中的 ColumnDef 一致。
+    pub fn scan_rows(&self, table_name: &str) -> Result<Vec<Vec<ferrisdb_storage::row_codec::Value>>> {
+        let meta = self.catalog.lookup_by_name(table_name).ok_or_else(|| {
+            FerrisDBError::Internal(format!("Table '{}' not found", table_name))
+        })?;
+        let col_types: Vec<ferrisdb_storage::catalog::DataType> =
+            meta.columns.iter().map(|c| c.data_type).collect();
+
+        let table = self.open_table(table_name)?;
+        let _txn = self.begin()?;
+        let mut result = Vec::new();
+        let mut scan = ferrisdb_transaction::HeapScan::new(&table);
+        while let Ok(Some((_tid, _hdr, data))) = scan.next() {
+            let payload = if data.len() > 32 { &data[32..] } else { &data };
+            if let Some(vals) = ferrisdb_storage::row_codec::decode_row(&col_types, payload) {
+                result.push(vals);
+            }
+        }
+        Ok(result)
+    }
+
+    /// 获取表的列类型列表（SQL 层 encode/decode 用）
+    pub fn table_column_types(&self, table_name: &str) -> Result<Vec<ferrisdb_storage::catalog::DataType>> {
+        let meta = self.catalog.lookup_by_name(table_name).ok_or_else(|| {
+            FerrisDBError::Internal(format!("Table '{}' not found", table_name))
+        })?;
+        Ok(meta.columns.iter().map(|c| c.data_type).collect())
+    }
 }
 
 #[cfg(test)]

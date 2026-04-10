@@ -137,7 +137,7 @@ impl AsyncDB for FerrisDB {
 
 impl FerrisDB {
     fn handle_create_table(&mut self, sql: &str) -> Result<(), String> {
-        use ferrisdb_storage::catalog::{ColumnDef, DataType};
+        use ferrisdb::{ColumnDef, DataType};
 
         // 简单解析: CREATE TABLE name (col1 TYPE, col2 TYPE, ...)
         let upper = sql.to_uppercase();
@@ -185,8 +185,7 @@ impl FerrisDB {
     }
 
     fn handle_insert(&self, sql: &str) -> Result<u64, String> {
-        use ferrisdb_storage::catalog::DataType;
-        use ferrisdb_storage::row_codec::{encode_row, Value};
+        use ferrisdb::{DataType, encode_row, Value};
 
         // 简单解析: INSERT INTO table VALUES (v1, v2), (v3, v4)
         let upper = sql.to_uppercase();

@@ -12,9 +12,7 @@ name = "tpcc"
 path = "src/tpcc.rs"
 
 [dependencies]
-ferrisdb-core = { path = "../ferrisdb-core" }
-ferrisdb-storage = { path = "../ferrisdb-storage" }
-ferrisdb-transaction = { path = "../ferrisdb-transaction" }
+ferrisdb = { path = "../ferrisdb" }
 
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

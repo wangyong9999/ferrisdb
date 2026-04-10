@@ -1,11 +1,128 @@
 //! System Catalog — 持久化的系统表元数据管理
 //!
 //! 管理表、索引等数据库对象的元数据，支持持久化到磁盘文件。
+//!
+//! 等价于 PostgreSQL/openGauss 的 pg_class + pg_attribute：
+//! - RelationMeta = pg_class（关系级：表名、OID、页面数）
+//! - ColumnDef = pg_attribute（列级：列名、类型、可空、位置）
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use parking_lot::RwLock;
 use ferrisdb_core::{Result, FerrisDBError};
+
+// ============================================================
+// 数据类型定义（等价于 pg_type 的核心子集）
+// ============================================================
+
+/// 列数据类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DataType {
+    /// 32 位有符号整数
+    Int32 = 0,
+    /// 64 位有符号整数
+    Int64 = 1,
+    /// 64 位浮点数
+    Float64 = 2,
+    /// 变长 UTF-8 文本
+    Text = 3,
+    /// 布尔值
+    Boolean = 4,
+    /// 变长字节数组
+    Bytes = 5,
+}
+
+impl DataType {
+    /// 从 u8 反序列化
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Int32),
+            1 => Some(Self::Int64),
+            2 => Some(Self::Float64),
+            3 => Some(Self::Text),
+            4 => Some(Self::Boolean),
+            5 => Some(Self::Bytes),
+            _ => None,
+        }
+    }
+
+    /// 固定长度类型的字节大小（变长类型返回 None）
+    pub fn fixed_size(&self) -> Option<usize> {
+        match self {
+            Self::Int32 => Some(4),
+            Self::Int64 => Some(8),
+            Self::Float64 => Some(8),
+            Self::Boolean => Some(1),
+            Self::Text | Self::Bytes => None,
+        }
+    }
+
+    /// 类型名称（SQL 显示用）
+    pub fn sql_name(&self) -> &'static str {
+        match self {
+            Self::Int32 => "INT",
+            Self::Int64 => "BIGINT",
+            Self::Float64 => "DOUBLE",
+            Self::Text => "TEXT",
+            Self::Boolean => "BOOLEAN",
+            Self::Bytes => "BYTEA",
+        }
+    }
+}
+
+// ============================================================
+// 列定义（等价于 pg_attribute）
+// ============================================================
+
+/// 列定义
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDef {
+    /// 列名
+    pub name: String,
+    /// 数据类型
+    pub data_type: DataType,
+    /// 是否允许 NULL
+    pub nullable: bool,
+    /// 列在表中的位置（0-based）
+    pub position: u16,
+}
+
+impl ColumnDef {
+    /// 创建列定义
+    pub fn new(name: &str, data_type: DataType, nullable: bool, position: u16) -> Self {
+        Self {
+            name: name.to_string(),
+            data_type,
+            nullable,
+            position,
+        }
+    }
+
+    /// 序列化为字节
+    fn to_bytes(&self) -> Vec<u8> {
+        let name_bytes = self.name.as_bytes();
+        let mut buf = Vec::with_capacity(6 + name_bytes.len());
+        buf.push(self.data_type as u8);
+        buf.push(if self.nullable { 1 } else { 0 });
+        buf.extend_from_slice(&self.position.to_le_bytes());
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+        buf
+    }
+
+    /// 从字节反序列化
+    fn from_bytes(data: &[u8]) -> Option<(Self, usize)> {
+        if data.len() < 6 { return None; }
+        let data_type = DataType::from_u8(data[0])?;
+        let nullable = data[1] != 0;
+        let position = u16::from_le_bytes(data[2..4].try_into().ok()?);
+        let name_len = u16::from_le_bytes(data[4..6].try_into().ok()?) as usize;
+        if data.len() < 6 + name_len { return None; }
+        let name = String::from_utf8(data[6..6 + name_len].to_vec()).ok()?;
+        Some((Self { name, data_type, nullable, position }, 6 + name_len))
+    }
+}
 
 /// Relation 类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +137,8 @@ pub enum RelationType {
 }
 
 /// Relation 元数据（可持久化）
+///
+/// 等价于 pg_class 的核心字段 + 内联 pg_attribute 列定义。
 #[derive(Debug, Clone)]
 pub struct RelationMeta {
     /// Relation OID
@@ -36,13 +155,20 @@ pub struct RelationMeta {
     pub current_pages: u32,
     /// 索引 root page（仅 Index 类型使用）
     pub root_page: u32,
+    /// 列定义（等价于 pg_attribute）— 仅 Table 类型有意义
+    pub columns: Vec<ColumnDef>,
 }
 
 impl RelationMeta {
-    /// 序列化为字节（定长部分 + 变长 name）
+    /// 序列化为字节
+    ///
+    /// 格式: [oid:4][type:1][tablespace:4][owner:4][pages:4][root:4]
+    ///        [name_len:2][name][col_count:2][col1_bytes][col2_bytes]...
+    ///
+    /// 向后兼容：旧格式无 col_count 字段，from_bytes 检测剩余长度判断。
     fn to_bytes(&self) -> Vec<u8> {
         let name_bytes = self.name.as_bytes();
-        let mut buf = Vec::with_capacity(24 + name_bytes.len());
+        let mut buf = Vec::with_capacity(32 + name_bytes.len());
         buf.extend_from_slice(&self.oid.to_le_bytes());
         buf.push(self.rel_type as u8);
         buf.extend_from_slice(&self.tablespace_id.to_le_bytes());
@@ -51,10 +177,15 @@ impl RelationMeta {
         buf.extend_from_slice(&self.root_page.to_le_bytes());
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(name_bytes);
+        // 列定义（新增，向后兼容）
+        buf.extend_from_slice(&(self.columns.len() as u16).to_le_bytes());
+        for col in &self.columns {
+            buf.extend_from_slice(&col.to_bytes());
+        }
         buf
     }
 
-    /// 从字节反序列化
+    /// 从字节反序列化（向后兼容：无列定义的旧格式也能读）
     fn from_bytes(data: &[u8]) -> Option<(Self, usize)> {
         if data.len() < 23 { return None; }
         let oid = u32::from_le_bytes(data[0..4].try_into().ok()?);
@@ -71,8 +202,25 @@ impl RelationMeta {
         let name_len = u16::from_le_bytes(data[21..23].try_into().ok()?) as usize;
         if data.len() < 23 + name_len { return None; }
         let name = String::from_utf8(data[23..23 + name_len].to_vec()).ok()?;
-        let consumed = 23 + name_len;
-        Some((Self { oid, name, rel_type, tablespace_id, owner_table, current_pages, root_page }, consumed))
+        let mut offset = 23 + name_len;
+
+        // 列定义（新格式才有）
+        let mut columns = Vec::new();
+        if offset + 2 <= data.len() {
+            let col_count = u16::from_le_bytes(data[offset..offset+2].try_into().ok()?) as usize;
+            offset += 2;
+            for _ in 0..col_count {
+                if offset >= data.len() { break; }
+                if let Some((col, consumed)) = ColumnDef::from_bytes(&data[offset..]) {
+                    columns.push(col);
+                    offset += consumed;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Some((Self { oid, name, rel_type, tablespace_id, owner_table, current_pages, root_page, columns }, offset))
     }
 }
 
@@ -164,12 +312,22 @@ impl SystemCatalog {
         Ok(())
     }
 
-    /// 创建表
+    /// 创建表（无 Schema — 向后兼容）
     pub fn create_table(&self, name: &str, tablespace_id: u32) -> Result<u32> {
+        self.create_table_with_schema(name, tablespace_id, vec![])
+    }
+
+    /// 创建表（带列定义 Schema）
+    pub fn create_table_with_schema(&self, name: &str, tablespace_id: u32, columns: Vec<ColumnDef>) -> Result<u32> {
+        // 检查重名
+        if self.name_index.read().contains_key(name) {
+            return Err(FerrisDBError::Internal(format!("Table '{}' already exists", name)));
+        }
         let oid = self.next_oid.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let meta = RelationMeta {
             oid, name: name.to_string(), rel_type: RelationType::Table,
             tablespace_id, owner_table: 0, current_pages: 0, root_page: u32::MAX,
+            columns,
         };
         self.relations.write().insert(oid, meta);
         self.name_index.write().insert(name.to_string(), oid);
@@ -186,6 +344,7 @@ impl SystemCatalog {
         let meta = RelationMeta {
             oid, name: name.to_string(), rel_type: RelationType::Index,
             tablespace_id, owner_table: table_oid, current_pages: 0, root_page: u32::MAX,
+            columns: vec![],
         };
         self.relations.write().insert(oid, meta);
         self.name_index.write().insert(name.to_string(), oid);
@@ -313,6 +472,7 @@ mod tests {
         let meta = RelationMeta {
             oid: 42, name: "test_table".to_string(), rel_type: RelationType::Table,
             tablespace_id: 1, owner_table: 0, current_pages: 100, root_page: u32::MAX,
+            columns: vec![],
         };
         let bytes = meta.to_bytes();
         let (restored, _) = RelationMeta::from_bytes(&bytes).unwrap();

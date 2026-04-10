@@ -22,7 +22,7 @@ pub mod wal;
 pub use buffer::{BufferDesc, BufferPool, BufferPoolConfig, BufTable, LruQueue, PinnedBuffer, BackgroundWriter};
 pub use index::{BTree, BTreeCursor, BTreeItem, BTreeKey, BTreePage, BTreePageType, BTreeStats, BTreeValue};
 pub use page::{PageHeader, PageId, HeapPage, ItemIdData, ItemIdFlags, ItemPointerData};
-pub use catalog::{SystemCatalog, RelationMeta, RelationType};
+pub use catalog::{SystemCatalog, RelationMeta, RelationType, ColumnDef, DataType};
 pub use control::{ControlFile, ControlFileData};
 pub use lob::{LobStore, LobHeader, LOB_CHUNK_SIZE};
 pub use parallel_scan::{ParallelScanCoordinator, parallel_scan};

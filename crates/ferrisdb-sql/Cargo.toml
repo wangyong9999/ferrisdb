@@ -1,0 +1,40 @@
+[package]
+name = "ferrisdb-sql"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.75"
+authors.workspace = true
+license.workspace = true
+description = "FerrisDB SQL Server — DataFusion + pgwire integration"
+
+[dependencies]
+# Internal crates
+ferrisdb = { path = "../ferrisdb" }
+ferrisdb-core = { path = "../ferrisdb-core" }
+ferrisdb-storage = { path = "../ferrisdb-storage" }
+ferrisdb-transaction = { path = "../ferrisdb-transaction" }
+
+# SQL engine
+datafusion = "45"
+
+# PostgreSQL wire protocol
+pgwire = "0.28"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Arrow (comes with DataFusion but we need direct access)
+arrow = { version = "54", features = ["prettyprint"] }
+arrow-schema = "54"
+arrow-array = "54"
+
+# Async utilities
+async-trait = "0.1"
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "ferrisdb-sql"
+path = "src/main.rs"

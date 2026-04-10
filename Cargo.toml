@@ -6,6 +6,7 @@ members = [
     "crates/ferrisdb-transaction",
     "crates/ferrisdb",
     "crates/ferrisdb-bench",
+    "crates/ferrisdb-sql",
 ]
 
 [workspace.package]

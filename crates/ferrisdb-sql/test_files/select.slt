@@ -1,0 +1,153 @@
+# FerrisDB SELECT 基础能力验证
+# 对标 DataFusion select.slt 核心子集
+
+# 建表
+statement ok
+CREATE TABLE t1 (id INT, name TEXT, score DOUBLE)
+
+# 插入数据
+statement ok
+INSERT INTO t1 VALUES (1, 'Alice', 95.5)
+
+statement ok
+INSERT INTO t1 VALUES (2, 'Bob', 87.0)
+
+statement ok
+INSERT INTO t1 VALUES (3, 'Charlie', 92.3)
+
+# SELECT *
+query ITR rowsort
+SELECT * FROM ferrisdb.public.t1
+----
+1 Alice 95.5
+2 Bob 87.0
+3 Charlie 92.3
+
+# 列投影
+query T rowsort
+SELECT name FROM ferrisdb.public.t1
+----
+Alice
+Bob
+Charlie
+
+# 表达式
+query IR rowsort
+SELECT id, score * 2 FROM ferrisdb.public.t1
+----
+1 191.0
+2 174.0
+3 184.6
+
+# WHERE 等值
+query IT
+SELECT id, name FROM ferrisdb.public.t1 WHERE id = 2
+----
+2 Bob
+
+# WHERE 范围
+query IT rowsort
+SELECT id, name FROM ferrisdb.public.t1 WHERE score > 90
+----
+1 Alice
+3 Charlie
+
+# WHERE AND
+query IT
+SELECT id, name FROM ferrisdb.public.t1 WHERE id > 1 AND score > 90
+----
+3 Charlie
+
+# WHERE OR
+query IT rowsort
+SELECT id, name FROM ferrisdb.public.t1 WHERE id = 1 OR id = 3
+----
+1 Alice
+3 Charlie
+
+# WHERE IN
+query IT rowsort
+SELECT id, name FROM ferrisdb.public.t1 WHERE id IN (1, 3)
+----
+1 Alice
+3 Charlie
+
+# WHERE LIKE
+query IT rowsort
+SELECT id, name FROM ferrisdb.public.t1 WHERE name LIKE 'A%'
+----
+1 Alice
+
+# WHERE BETWEEN
+query IT rowsort
+SELECT id, name FROM ferrisdb.public.t1 WHERE score BETWEEN 87 AND 93
+----
+2 Bob
+3 Charlie
+
+# ORDER BY ASC
+query IT
+SELECT id, name FROM ferrisdb.public.t1 ORDER BY id ASC
+----
+1 Alice
+2 Bob
+3 Charlie
+
+# ORDER BY DESC
+query IT
+SELECT id, name FROM ferrisdb.public.t1 ORDER BY id DESC
+----
+3 Charlie
+2 Bob
+1 Alice
+
+# LIMIT
+query IT
+SELECT id, name FROM ferrisdb.public.t1 ORDER BY id LIMIT 2
+----
+1 Alice
+2 Bob
+
+# LIMIT OFFSET
+query IT
+SELECT id, name FROM ferrisdb.public.t1 ORDER BY id LIMIT 1 OFFSET 1
+----
+2 Bob
+
+# DISTINCT
+query T rowsort
+SELECT DISTINCT name FROM ferrisdb.public.t1
+----
+Alice
+Bob
+Charlie
+
+# COUNT
+query I
+SELECT COUNT(*) FROM ferrisdb.public.t1
+----
+3
+
+# CAST
+query T
+SELECT CAST(42 AS VARCHAR)
+----
+42
+
+# CASE WHEN
+query T
+SELECT CASE WHEN id < 2 THEN 'low' ELSE 'high' END FROM ferrisdb.public.t1 WHERE id = 1
+----
+low
+
+# COALESCE (no table needed)
+query I
+SELECT COALESCE(NULL, 42)
+----
+42
+
+# NULLIF
+query I
+SELECT NULLIF(1, 1)
+----
+NULL

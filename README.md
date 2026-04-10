@@ -15,6 +15,8 @@ FerrisDB achieves **3x+ throughput** over the reference C++ implementation on st
 - **Crash Recovery** — WAL redo + automatic undo rollback of uncommitted transactions
 - **B+Tree Indexes** — Concurrent insert/delete/scan with page split and right-link traversal
 - **Data Integrity** — Page CRC32C, WAL CRC32, torn page detection, full-page writes
+- **SQL Query Engine** — Apache DataFusion integration with PostgreSQL wire protocol (pgwire)
+- **10 Data Types** — Int16, Int32, Int64, Float32, Float64, Text, Boolean, Bytes, Timestamp, Date
 - **Automatic Checkpoint** — Periodic dirty page flush + WAL truncation (configurable interval)
 - **AutoVacuum** — Background dead tuple reclamation with transaction timeout enforcement
 - **Graceful Shutdown** — Wait for in-flight transactions, final checkpoint, fsync all data files
@@ -36,8 +38,14 @@ Full TPC-C benchmark with all 5 transaction types (NewOrder 45%, Payment 43%, Or
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   ferrisdb-bench                     │
-│              TPC-C Benchmark (5 txn types)           │
+│              psql / JDBC / any PG client             │
+├─────────────────────────────────────────────────────┤
+│                    ferrisdb-sql                       │
+│  pgwire (PG protocol) · DataFusion (SQL engine)      │
+│  Row ↔ Arrow conversion · SystemCatalog DDL          │
+├─────────────────────────────────────────────────────┤
+│                   ferrisdb-bench                      │
+│              TPC-C Benchmark (5 txn types)            │
 ├─────────────────────────────────────────────────────┤
 │                      ferrisdb                        │
 │  Engine · ManagedTable · Checkpoint · AutoVacuum     │
@@ -57,6 +65,7 @@ Full TPC-C benchmark with all 5 transaction types (NewOrder 45%, Payment 43%, Or
 
 | Crate | Description |
 |-------|-------------|
+| `ferrisdb-sql` | SQL frontend: Apache DataFusion query engine, pgwire PostgreSQL protocol server, Row↔Arrow conversion, catalog integration |
 | `ferrisdb` | Engine facade: lifecycle (open/shutdown), checkpoint scheduling, autovacuum, transaction timeout enforcement, DDL, `EngineStats` monitoring API |
 | `ferrisdb-core` | Primitive types (Xid, CSN, LSN), lock primitives (LWLock, ContentLock, SpinLock), GUC configuration, statistics |
 | `ferrisdb-storage` | Buffer pool with LRU eviction, B+Tree with WAL, write-ahead log with CRC32 and recovery, page management, storage manager, tablespace/segment |
@@ -69,7 +78,7 @@ Full TPC-C benchmark with all 5 transaction types (NewOrder 45%, Payment 43%, Or
 # Build
 cargo build --release
 
-# Run all 1016 tests
+# Run all 1100+ tests
 cargo test --all
 
 # TPC-C benchmark (in-memory mode)
@@ -85,6 +94,52 @@ cargo run --release --bin tpcc -- \
     --warehouses 20 --threads 20 --duration 120 \
     --buffer-size 300000 --wal
 ```
+
+## SQL Layer
+
+FerrisDB includes a full SQL query layer powered by [Apache DataFusion](https://github.com/apache/datafusion) and [pgwire](https://github.com/sunng87/pgwire), enabling standard PostgreSQL client connectivity.
+
+```bash
+# Start the SQL server (default port 5433)
+cargo run --release -p ferrisdb-sql -- /tmp/ferrisdb-data 5433
+
+# Connect with psql
+psql -h 127.0.0.1 -p 5433
+
+# Example session
+CREATE TABLE users (id INT, name TEXT, score DOUBLE);
+INSERT INTO users VALUES (1, 'Alice', 95.5), (2, 'Bob', 87.0);
+SELECT name, score FROM users WHERE score > 90 ORDER BY score DESC;
+```
+
+### Supported SQL Features
+
+| Category | Features |
+|----------|----------|
+| **DML** | SELECT, INSERT, UPDATE, DELETE |
+| **DDL** | CREATE TABLE, DROP TABLE |
+| **Queries** | WHERE, ORDER BY (ASC/DESC), LIMIT, OFFSET, DISTINCT |
+| **Joins** | INNER, LEFT, RIGHT, FULL OUTER, CROSS JOIN |
+| **Aggregation** | COUNT, SUM, AVG, MIN, MAX, GROUP BY, HAVING |
+| **Window** | ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, PARTITION BY |
+| **Subqueries** | FROM subquery, WHERE IN subquery, CTE (WITH ... AS) |
+| **Set Ops** | UNION ALL, INTERSECT, EXCEPT |
+| **Functions** | UPPER, LOWER, LENGTH, SUBSTRING, CONCAT, TRIM, REPLACE, ABS, ROUND, CEIL, FLOOR, POWER, SQRT, COALESCE, NULLIF, CAST, CASE WHEN |
+| **Types** | INT (16/32/64), FLOAT (32/64), TEXT, BOOLEAN, BYTES, TIMESTAMP, DATE |
+
+### Query Architecture
+
+```
+psql ──► pgwire (TCP) ──► DataFusion (parse + optimize + execute)
+                                │
+                          Arrow RecordBatch
+                                │
+                     FerrisTable (TableProvider)
+                                │
+                     HeapTable scan ──► Row decode ──► Arrow conversion
+```
+
+DataFusion handles SQL parsing, query optimization, and execution on Arrow columnar batches. FerrisDB provides the storage backend through the `TableProvider` trait, with limit pushdown for early scan termination.
 
 ## Storage Engine Internals
 
@@ -154,13 +209,14 @@ max_connections = 64             # Max concurrent transaction slots
 
 ## Testing
 
-1,016 tests organized by subsystem:
+1,100+ tests organized by subsystem:
 
 ```bash
 cargo test -p ferrisdb-core         # 117 tests: locks, atomics, config, logging, stats
 cargo test -p ferrisdb-storage      # 585 tests: buffer, B-Tree, WAL, pages, recovery, CRC, checkpoint
 cargo test -p ferrisdb-transaction  # 233 tests: transactions, heap, MVCC, undo, crash recovery e2e
 cargo test -p ferrisdb              #  81 tests: engine, managed table, DDL, expression index
+cargo test -p ferrisdb-sql          #  91 tests: SQL capability, sqllogictest, integration
 ```
 
 Test categories include:
@@ -170,6 +226,7 @@ Test categories include:
 - Concurrent stress tests (4–16 threads, 30x stability verified)
 - Fault injection (CRC corruption, torn pages, pool exhaustion)
 - Edge cases (empty keys, max-size tuples, boundary conditions)
+- **sqllogictest** — 6 `.slt` files (select, aggregate, join, window, CTE, functions) with ~70 test points
 
 ## Design Decisions
 

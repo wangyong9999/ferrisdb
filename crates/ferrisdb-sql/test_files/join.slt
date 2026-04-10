@@ -1,0 +1,71 @@
+# FerrisDB JOIN 能力验证
+# 对标 DataFusion joins.slt 核心子集
+
+statement ok
+CREATE TABLE users (id INT, name TEXT)
+
+statement ok
+CREATE TABLE orders (order_id INT, user_id INT, amount BIGINT)
+
+statement ok
+INSERT INTO users VALUES (1, 'Alice')
+
+statement ok
+INSERT INTO users VALUES (2, 'Bob')
+
+statement ok
+INSERT INTO users VALUES (3, 'Charlie')
+
+statement ok
+INSERT INTO orders VALUES (100, 1, 500)
+
+statement ok
+INSERT INTO orders VALUES (101, 1, 300)
+
+statement ok
+INSERT INTO orders VALUES (102, 2, 400)
+
+statement ok
+INSERT INTO orders VALUES (103, 99, 100)
+
+# INNER JOIN
+query TI rowsort
+SELECT u.name, o.amount FROM ferrisdb.public.users u JOIN ferrisdb.public.orders o ON u.id = o.user_id
+----
+Alice 300
+Alice 500
+Bob 400
+
+# LEFT JOIN (Charlie has no orders)
+query TI rowsort
+SELECT u.name, o.amount FROM ferrisdb.public.users u LEFT JOIN ferrisdb.public.orders o ON u.id = o.user_id
+----
+Alice 300
+Alice 500
+Bob 400
+Charlie NULL
+
+# RIGHT JOIN (order 103 has no matching user)
+query TI rowsort
+SELECT u.name, o.amount FROM ferrisdb.public.users u RIGHT JOIN ferrisdb.public.orders o ON u.id = o.user_id
+----
+Alice 300
+Alice 500
+Bob 400
+NULL 100
+
+# CROSS JOIN
+query IT rowsort
+SELECT u.id, o.order_id FROM ferrisdb.public.users u CROSS JOIN ferrisdb.public.orders o WHERE u.id = 1
+----
+1 100
+1 101
+1 102
+1 103
+
+# JOIN + GROUP BY
+query TI rowsort
+SELECT u.name, SUM(o.amount) FROM ferrisdb.public.users u JOIN ferrisdb.public.orders o ON u.id = o.user_id GROUP BY u.name
+----
+Alice 800
+Bob 400

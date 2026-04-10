@@ -1,0 +1,77 @@
+# FerrisDB 聚合能力验证
+# 对标 DataFusion aggregate.slt 核心子集
+
+statement ok
+CREATE TABLE sales (id INT, region TEXT, amount BIGINT)
+
+statement ok
+INSERT INTO sales VALUES (1, 'east', 100)
+
+statement ok
+INSERT INTO sales VALUES (2, 'west', 200)
+
+statement ok
+INSERT INTO sales VALUES (3, 'east', 150)
+
+statement ok
+INSERT INTO sales VALUES (4, 'west', 300)
+
+statement ok
+INSERT INTO sales VALUES (5, 'east', 250)
+
+# COUNT
+query I
+SELECT COUNT(*) FROM ferrisdb.public.sales
+----
+5
+
+# SUM
+query I
+SELECT SUM(amount) FROM ferrisdb.public.sales
+----
+1000
+
+# AVG
+query R
+SELECT AVG(amount) FROM ferrisdb.public.sales
+----
+200.0
+
+# MIN / MAX
+query II
+SELECT MIN(amount), MAX(amount) FROM ferrisdb.public.sales
+----
+100 300
+
+# GROUP BY
+query TI rowsort
+SELECT region, SUM(amount) FROM ferrisdb.public.sales GROUP BY region
+----
+east 500
+west 500
+
+# GROUP BY + COUNT
+query TI rowsort
+SELECT region, COUNT(*) FROM ferrisdb.public.sales GROUP BY region
+----
+east 3
+west 2
+
+# HAVING
+query TI
+SELECT region, SUM(amount) as total FROM ferrisdb.public.sales GROUP BY region HAVING SUM(amount) > 400 ORDER BY region
+----
+east 500
+west 500
+
+# Aggregate with WHERE
+query I
+SELECT SUM(amount) FROM ferrisdb.public.sales WHERE region = 'east'
+----
+500
+
+# Multiple aggregates
+query IIRI
+SELECT COUNT(*), SUM(amount), AVG(amount), MAX(amount) FROM ferrisdb.public.sales
+----
+5 1000 200.0 300

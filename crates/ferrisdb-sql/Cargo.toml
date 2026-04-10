@@ -34,6 +34,7 @@ futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+sqllogictest = "0.29"
 
 [[bin]]
 name = "ferrisdb-sql"

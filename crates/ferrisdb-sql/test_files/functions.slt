@@ -1,0 +1,198 @@
+# FerrisDB 标量函数验证
+# 对标 DataFusion functions.slt + strings.slt 核心子集
+
+# ============================================
+# 字符串函数
+# ============================================
+
+# UPPER / LOWER
+query TT
+SELECT UPPER('hello'), LOWER('WORLD')
+----
+HELLO world
+
+# LENGTH
+query I
+SELECT LENGTH('FerrisDB')
+----
+8
+
+# CONCAT
+query T
+SELECT CONCAT('Hello', ' ', 'World')
+----
+Hello World
+
+# SUBSTRING
+query T
+SELECT SUBSTRING('FerrisDB', 1, 6)
+----
+Ferris
+
+# REPLACE
+query T
+SELECT REPLACE('Hello World', 'World', 'Rust')
+----
+Hello Rust
+
+# TRIM / LTRIM / RTRIM
+query T
+SELECT TRIM('  hello  ')
+----
+hello
+
+query T
+SELECT LTRIM('  hello  ')
+----
+hello
+
+query T
+SELECT RTRIM('  hello  ')
+----
+  hello
+
+# REPEAT
+query T
+SELECT REPEAT('ab', 3)
+----
+ababab
+
+# LEFT / RIGHT
+query TT
+SELECT LEFT('FerrisDB', 6), RIGHT('FerrisDB', 2)
+----
+Ferris DB
+
+# STARTS_WITH / ENDS_WITH
+query BB
+SELECT STARTS_WITH('FerrisDB', 'Ferris'), ENDS_WITH('FerrisDB', 'DB')
+----
+true true
+
+# ============================================
+# 数学函数
+# ============================================
+
+# ABS
+query R
+SELECT ABS(-42.5)
+----
+42.5
+
+# CEIL / FLOOR
+query RR
+SELECT CEIL(3.2), FLOOR(3.8)
+----
+4.0 3.0
+
+# ROUND
+query R
+SELECT ROUND(3.14159, 2)
+----
+3.14
+
+# POWER / SQRT
+query IR
+SELECT POWER(2, 10), SQRT(144)
+----
+1024 12.0
+
+# LN / LOG / LOG2 / LOG10
+query R
+SELECT ROUND(LN(2.718281828), 2)
+----
+1.0
+
+# SIGNUM
+query RRR
+SELECT SIGNUM(-5.0), SIGNUM(0.0), SIGNUM(5.0)
+----
+-1.0 0.0 1.0
+
+# ============================================
+# 条件函数
+# ============================================
+
+# COALESCE
+query I
+SELECT COALESCE(NULL, NULL, 42)
+----
+42
+
+# NULLIF
+query I
+SELECT NULLIF(1, 1)
+----
+NULL
+
+query I
+SELECT NULLIF(1, 2)
+----
+1
+
+# CASE WHEN
+query T
+SELECT CASE WHEN 1 > 2 THEN 'yes' ELSE 'no' END
+----
+no
+
+# Searched CASE
+query T
+SELECT CASE
+  WHEN 10 < 5 THEN 'small'
+  WHEN 10 < 15 THEN 'medium'
+  ELSE 'large'
+END
+----
+medium
+
+# ============================================
+# 类型转换
+# ============================================
+
+# CAST
+query T
+SELECT CAST(123 AS VARCHAR)
+----
+123
+
+query I
+SELECT CAST('456' AS INT)
+----
+456
+
+query R
+SELECT CAST(42 AS DOUBLE)
+----
+42.0
+
+# ============================================
+# 表上的函数应用
+# ============================================
+
+statement ok
+CREATE TABLE words (id INT, word TEXT)
+
+statement ok
+INSERT INTO words VALUES (1, 'Hello'),(2, 'WORLD'),(3, 'rust')
+
+query IT rowsort
+SELECT id, UPPER(word) FROM ferrisdb.public.words
+----
+1 HELLO
+2 WORLD
+3 RUST
+
+query IT rowsort
+SELECT id, LOWER(word) FROM ferrisdb.public.words
+----
+1 hello
+2 world
+3 rust
+
+query II rowsort
+SELECT id, LENGTH(word) FROM ferrisdb.public.words
+----
+1 5
+2 5
+3 4

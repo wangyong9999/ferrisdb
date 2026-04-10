@@ -16,6 +16,10 @@ pub fn to_arrow_type(dt: &DataType) -> ArrowDataType {
         DataType::Text => ArrowDataType::Utf8,
         DataType::Boolean => ArrowDataType::Boolean,
         DataType::Bytes => ArrowDataType::Binary,
+        DataType::Timestamp => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        DataType::Date => ArrowDataType::Date32,
+        DataType::Float32 => ArrowDataType::Float32,
+        DataType::Int16 => ArrowDataType::Int16,
     }
 }
 
@@ -77,6 +81,18 @@ pub fn batch_row_to_values(batch: &RecordBatch, row_idx: usize, col_types: &[Dat
             DataType::Bytes => {
                 Value::Bytes(col.as_any().downcast_ref::<BinaryArray>().unwrap().value(row_idx).to_vec())
             }
+            DataType::Timestamp => {
+                Value::Timestamp(col.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(row_idx))
+            }
+            DataType::Date => {
+                Value::Date(col.as_any().downcast_ref::<Date32Array>().unwrap().value(row_idx))
+            }
+            DataType::Float32 => {
+                Value::Float32(col.as_any().downcast_ref::<Float32Array>().unwrap().value(row_idx))
+            }
+            DataType::Int16 => {
+                Value::Int16(col.as_any().downcast_ref::<Int16Array>().unwrap().value(row_idx))
+            }
         };
         values.push(v);
     }
@@ -135,6 +151,42 @@ fn build_array(dt: &DataType, rows: &[Vec<Value>], col_idx: usize) -> Arc<dyn Ar
             let arr: BinaryArray = rows.iter().map(|row| {
                 match &row[col_idx] {
                     Value::Bytes(b) => Some(b.as_slice()),
+                    _ => None,
+                }
+            }).collect();
+            Arc::new(arr)
+        }
+        DataType::Timestamp => {
+            let arr: TimestampMicrosecondArray = rows.iter().map(|row| {
+                match &row[col_idx] {
+                    Value::Timestamp(v) => Some(*v),
+                    _ => None,
+                }
+            }).collect();
+            Arc::new(arr)
+        }
+        DataType::Date => {
+            let arr: Date32Array = rows.iter().map(|row| {
+                match &row[col_idx] {
+                    Value::Date(v) => Some(*v),
+                    _ => None,
+                }
+            }).collect();
+            Arc::new(arr)
+        }
+        DataType::Float32 => {
+            let arr: Float32Array = rows.iter().map(|row| {
+                match &row[col_idx] {
+                    Value::Float32(v) => Some(*v),
+                    _ => None,
+                }
+            }).collect();
+            Arc::new(arr)
+        }
+        DataType::Int16 => {
+            let arr: Int16Array = rows.iter().map(|row| {
+                match &row[col_idx] {
+                    Value::Int16(v) => Some(*v),
                     _ => None,
                 }
             }).collect();

@@ -31,6 +31,14 @@ pub enum DataType {
     Boolean = 4,
     /// 变长字节数组
     Bytes = 5,
+    /// 时间戳（微秒精度，UTC epoch）
+    Timestamp = 6,
+    /// 日期（天数，epoch 1970-01-01 起算）
+    Date = 7,
+    /// 32 位浮点数
+    Float32 = 8,
+    /// 16 位有符号整数
+    Int16 = 9,
 }
 
 impl DataType {
@@ -43,6 +51,10 @@ impl DataType {
             3 => Some(Self::Text),
             4 => Some(Self::Boolean),
             5 => Some(Self::Bytes),
+            6 => Some(Self::Timestamp),
+            7 => Some(Self::Date),
+            8 => Some(Self::Float32),
+            9 => Some(Self::Int16),
             _ => None,
         }
     }
@@ -54,6 +66,10 @@ impl DataType {
             Self::Int64 => Some(8),
             Self::Float64 => Some(8),
             Self::Boolean => Some(1),
+            Self::Timestamp => Some(8),
+            Self::Date => Some(4),
+            Self::Float32 => Some(4),
+            Self::Int16 => Some(2),
             Self::Text | Self::Bytes => None,
         }
     }
@@ -67,6 +83,10 @@ impl DataType {
             Self::Text => "TEXT",
             Self::Boolean => "BOOLEAN",
             Self::Bytes => "BYTEA",
+            Self::Timestamp => "TIMESTAMP",
+            Self::Date => "DATE",
+            Self::Float32 => "REAL",
+            Self::Int16 => "SMALLINT",
         }
     }
 }

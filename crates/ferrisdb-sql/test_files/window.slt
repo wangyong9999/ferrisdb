@@ -1,0 +1,79 @@
+# FerrisDB Window Functions 验证
+# 对标 DataFusion window.slt 核心子集
+
+statement ok
+CREATE TABLE scores (id INT, name TEXT, score BIGINT, team TEXT)
+
+statement ok
+INSERT INTO scores VALUES (1, 'Alice', 90, 'A'),(2, 'Bob', 85, 'A'),(3, 'Charlie', 95, 'B'),(4, 'Diana', 88, 'B'),(5, 'Eve', 92, 'A')
+
+# Verify
+query I
+SELECT COUNT(*) FROM ferrisdb.public.scores
+----
+5
+
+# ROW_NUMBER
+query IT
+SELECT id, name FROM (SELECT id, name, ROW_NUMBER() OVER (ORDER BY score DESC) as rn FROM ferrisdb.public.scores) sub WHERE rn <= 3
+----
+3 Charlie
+5 Eve
+1 Alice
+
+# RANK with ties
+statement ok
+CREATE TABLE ties (id INT, val INT)
+
+statement ok
+INSERT INTO ties VALUES (1, 10),(2, 10),(3, 20)
+
+query III
+SELECT id, val, RANK() OVER (ORDER BY val) as rnk FROM ferrisdb.public.ties ORDER BY id
+----
+1 10 1
+2 10 1
+3 20 3
+
+# DENSE_RANK
+query III
+SELECT id, val, DENSE_RANK() OVER (ORDER BY val) as drnk FROM ferrisdb.public.ties ORDER BY id
+----
+1 10 1
+2 10 1
+3 20 2
+
+# LAG / LEAD
+query IIT
+SELECT id, score, LAG(name) OVER (ORDER BY id) as prev_name FROM ferrisdb.public.scores ORDER BY id LIMIT 3
+----
+1 90 NULL
+2 85 Alice
+3 95 Bob
+
+# SUM OVER (PARTITION BY)
+query ITI rowsort
+SELECT id, team, SUM(score) OVER (PARTITION BY team) as team_total FROM ferrisdb.public.scores
+----
+1 A 267
+2 A 267
+3 B 183
+4 B 183
+5 A 267
+
+# COUNT OVER
+query II
+SELECT id, COUNT(*) OVER () as total FROM ferrisdb.public.scores ORDER BY id LIMIT 2
+----
+1 5
+2 5
+
+# AVG OVER (PARTITION BY)
+query ITR rowsort
+SELECT id, team, AVG(score) OVER (PARTITION BY team) as avg_score FROM ferrisdb.public.scores
+----
+1 A 89.0
+2 A 89.0
+3 B 91.5
+4 B 91.5
+5 A 89.0

@@ -1,0 +1,50 @@
+# FerrisDB CTE (Common Table Expressions) 验证
+# 对标 DataFusion cte.slt 核心子集
+
+statement ok
+CREATE TABLE emp (id INT, name TEXT, dept TEXT, sal BIGINT)
+
+statement ok
+INSERT INTO emp VALUES (1, 'A', 'e', 100),(2, 'B', 'e', 120),(3, 'C', 's', 90)
+
+# Verify all rows
+query I
+SELECT COUNT(*) FROM ferrisdb.public.emp
+----
+3
+
+# Basic CTE
+query IT rowsort
+WITH high_sal AS (SELECT * FROM ferrisdb.public.emp WHERE sal > 100)
+SELECT id, name FROM high_sal
+----
+2 B
+
+# CTE with aggregation
+query TR rowsort
+WITH dept_stats AS (
+  SELECT dept, AVG(sal) as avg_sal FROM ferrisdb.public.emp GROUP BY dept
+)
+SELECT dept, avg_sal FROM dept_stats
+----
+e 110.0
+s 90.0
+
+# Multiple CTEs
+query I
+WITH
+  eng AS (SELECT * FROM ferrisdb.public.emp WHERE dept = 'e'),
+  eng_high AS (SELECT * FROM eng WHERE sal > 110)
+SELECT COUNT(*) FROM eng_high
+----
+1
+
+# CTE with ORDER BY and LIMIT
+query IT
+WITH ranked AS (
+  SELECT id, name, sal FROM ferrisdb.public.emp
+)
+SELECT id, name FROM ranked ORDER BY sal DESC LIMIT 2
+----
+2 B
+1 A

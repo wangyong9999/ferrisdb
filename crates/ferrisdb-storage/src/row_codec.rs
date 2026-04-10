@@ -29,6 +29,14 @@ pub enum Value {
     Boolean(bool),
     /// 字节数组
     Bytes(Vec<u8>),
+    /// 时间戳（微秒精度 UTC epoch）
+    Timestamp(i64),
+    /// 日期（天数，1970-01-01 起算）
+    Date(i32),
+    /// 32 位浮点数
+    Float32(f32),
+    /// 16 位有符号整数
+    Int16(i16),
 }
 
 impl Value {
@@ -42,6 +50,10 @@ impl Value {
             Value::Text(_) => Some(DataType::Text),
             Value::Boolean(_) => Some(DataType::Boolean),
             Value::Bytes(_) => Some(DataType::Bytes),
+            Value::Timestamp(_) => Some(DataType::Timestamp),
+            Value::Date(_) => Some(DataType::Date),
+            Value::Float32(_) => Some(DataType::Float32),
+            Value::Int16(_) => Some(DataType::Int16),
         }
     }
 
@@ -86,6 +98,10 @@ pub fn encode_row(types: &[DataType], values: &[Value]) -> Vec<u8> {
                 buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 buf.extend_from_slice(b);
             }
+            (DataType::Timestamp, Value::Timestamp(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+            (DataType::Date, Value::Date(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+            (DataType::Float32, Value::Float32(v)) => buf.extend_from_slice(&v.to_le_bytes()),
+            (DataType::Int16, Value::Int16(v)) => buf.extend_from_slice(&v.to_le_bytes()),
             // 类型不匹配时按 null 处理
             _ => {
                 buf[i / 8] |= 1 << (i % 8);
@@ -161,6 +177,30 @@ pub fn decode_row(types: &[DataType], data: &[u8]) -> Option<Vec<Value>> {
                 if offset + len > data.len() { return None; }
                 values.push(Value::Bytes(data[offset..offset+len].to_vec()));
                 offset += len;
+            }
+            DataType::Timestamp => {
+                if offset + 8 > data.len() { return None; }
+                let v = i64::from_le_bytes(data[offset..offset+8].try_into().ok()?);
+                values.push(Value::Timestamp(v));
+                offset += 8;
+            }
+            DataType::Date => {
+                if offset + 4 > data.len() { return None; }
+                let v = i32::from_le_bytes(data[offset..offset+4].try_into().ok()?);
+                values.push(Value::Date(v));
+                offset += 4;
+            }
+            DataType::Float32 => {
+                if offset + 4 > data.len() { return None; }
+                let v = f32::from_le_bytes(data[offset..offset+4].try_into().ok()?);
+                values.push(Value::Float32(v));
+                offset += 4;
+            }
+            DataType::Int16 => {
+                if offset + 2 > data.len() { return None; }
+                let v = i16::from_le_bytes(data[offset..offset+2].try_into().ok()?);
+                values.push(Value::Int16(v));
+                offset += 2;
             }
         }
     }
@@ -280,6 +320,10 @@ mod tests {
                 DataType::Text => Value::Text(format!("val_{}", i)),
                 DataType::Boolean => Value::Boolean(i % 2 == 0),
                 DataType::Bytes => Value::Bytes(vec![i as u8; 3]),
+                DataType::Timestamp => Value::Timestamp(i as i64 * 1_000_000),
+                DataType::Date => Value::Date(i as i32 * 100),
+                DataType::Float32 => Value::Float32(i as f32 * 0.5),
+                DataType::Int16 => Value::Int16(i as i16),
             }
         }).collect();
         let encoded = encode_row(&types, &values);

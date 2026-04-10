@@ -65,14 +65,15 @@ impl TableProvider for FerrisTable {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // 同步扫描 FerrisDB HeapTable，收集所有可见行
+        // 同步扫描 FerrisDB HeapTable，收集可见行
         let engine = Arc::clone(&self.engine);
         let table_name = self.meta.name.clone();
         let columns = self.meta.columns.clone();
         let col_types: Vec<ferrisdb_storage::catalog::DataType> =
             columns.iter().map(|c| c.data_type).collect();
+        let scan_limit = limit;
 
         // spawn_blocking 桥接同步存储 → async DataFusion
         let rows = tokio::task::spawn_blocking(move || -> Vec<Vec<Value>> {
@@ -81,7 +82,7 @@ impl TableProvider for FerrisTable {
                 Err(_) => return vec![],
             };
             let txn_mgr = engine.txn_manager();
-            let txn = match txn_mgr.begin() {
+            let _txn = match txn_mgr.begin() {
                 Ok(t) => t,
                 Err(_) => return vec![],
             };
@@ -89,11 +90,15 @@ impl TableProvider for FerrisTable {
             let mut result = Vec::new();
             let mut scan = ferrisdb_transaction::HeapScan::new(&table);
             while let Ok(Some((_tid, _hdr, data))) = scan.next() {
-                // HeapTable::insert 构造 TupleHeader(32B) + data
-                // scan 返回的 data = TupleHeader(32B) + 用户数据
                 let payload = if data.len() > 32 { &data[32..] } else { &data };
                 if let Some(vals) = decode_row(&col_types, payload) {
                     result.push(vals);
+                    // Limit pushdown: 提前终止扫描
+                    if let Some(lim) = scan_limit {
+                        if result.len() >= lim {
+                            break;
+                        }
+                    }
                 }
             }
             result

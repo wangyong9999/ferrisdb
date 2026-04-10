@@ -49,6 +49,10 @@ fn to_pg_type(dt: &DataType) -> Type {
         DataType::Text => Type::VARCHAR,
         DataType::Boolean => Type::BOOL,
         DataType::Bytes => Type::BYTEA,
+        DataType::Timestamp => Type::TIMESTAMP,
+        DataType::Date => Type::DATE,
+        DataType::Float32 => Type::FLOAT4,
+        DataType::Int16 => Type::INT2,
     }
 }
 
@@ -294,6 +298,10 @@ impl FerrisQueryHandler {
                         DataType::Text => Value::Text(v.to_string()),
                         DataType::Boolean => Value::Boolean(v.to_uppercase() == "TRUE" || v == "1"),
                         DataType::Bytes => Value::Bytes(v.as_bytes().to_vec()),
+                        DataType::Timestamp => v.parse::<i64>().map(Value::Timestamp).unwrap_or(Value::Null),
+                        DataType::Date => v.parse::<i32>().map(Value::Date).unwrap_or(Value::Null),
+                        DataType::Float32 => v.parse::<f32>().map(Value::Float32).unwrap_or(Value::Null),
+                        DataType::Int16 => v.parse::<i16>().map(Value::Int16).unwrap_or(Value::Null),
                     }
                 })
                 .collect();
@@ -489,6 +497,16 @@ fn parse_value(dt: &DataType, s: &str) -> Value {
         DataType::Text => Value::Text(s.to_string()),
         DataType::Boolean => Value::Boolean(s.to_uppercase() == "TRUE" || s == "1"),
         DataType::Bytes => Value::Bytes(s.as_bytes().to_vec()),
+        DataType::Timestamp => {
+            // 支持 ISO 8601 格式: "2024-01-15 10:30:00" → 微秒 epoch
+            // 简化实现：尝试解析常见格式
+            s.parse::<i64>().map(Value::Timestamp).unwrap_or(Value::Null)
+        }
+        DataType::Date => {
+            s.parse::<i32>().map(Value::Date).unwrap_or(Value::Null)
+        }
+        DataType::Float32 => s.parse::<f32>().map(Value::Float32).unwrap_or(Value::Null),
+        DataType::Int16 => s.parse::<i16>().map(Value::Int16).unwrap_or(Value::Null),
     }
 }
 

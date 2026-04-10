@@ -90,6 +90,33 @@ impl SimpleQueryHandler for FerrisQueryHandler {
             return self.handle_insert(trimmed).await;
         }
 
+        // DELETE
+        if trimmed.to_uppercase().starts_with("DELETE") {
+            return self.handle_delete(trimmed).await;
+        }
+
+        // UPDATE
+        if trimmed.to_uppercase().starts_with("UPDATE") {
+            return self.handle_update(trimmed).await;
+        }
+
+        // DROP TABLE
+        if trimmed.to_uppercase().starts_with("DROP TABLE") {
+            return self.handle_drop_table(trimmed).await;
+        }
+
+        // BEGIN/COMMIT/ROLLBACK (暂时返回 OK，事务在每条语句级别自动管理)
+        let upper = trimmed.to_uppercase();
+        if upper == "BEGIN" || upper == "START TRANSACTION" {
+            return Ok(vec![Response::Execution(Tag::new("BEGIN"))]);
+        }
+        if upper == "COMMIT" || upper == "END" {
+            return Ok(vec![Response::Execution(Tag::new("COMMIT"))]);
+        }
+        if upper == "ROLLBACK" {
+            return Ok(vec![Response::Execution(Tag::new("ROLLBACK"))]);
+        }
+
         // SELECT 和其他查询走 DataFusion
         let ctx = create_session(Arc::clone(&self.engine));
 
@@ -298,6 +325,170 @@ impl FerrisQueryHandler {
         }
 
         Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(inserted))])
+    }
+
+    /// 处理 DELETE FROM table WHERE ...
+    async fn handle_delete<'a>(&self, sql: &'a str) -> PgWireResult<Vec<Response<'a>>> {
+        // 简单解析: DELETE FROM table [WHERE condition]
+        let sql_upper = sql.to_uppercase();
+        let from_pos = sql_upper.find("FROM").map(|i| i + 4).unwrap_or(0);
+        let rest = sql[from_pos..].trim();
+
+        let (table_name, _where_clause) = if let Some(w) = rest.to_uppercase().find("WHERE") {
+            (rest[..w].trim().to_lowercase(), Some(&rest[w+5..]))
+        } else {
+            (rest.trim().to_lowercase(), None)
+        };
+
+        // 打开表
+        let table = self.engine.open_table(&table_name).map_err(|e| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "42P01".to_owned(), format!("{}", e),
+            )))
+        })?;
+
+        let meta = self.engine.catalog().lookup_by_name(&table_name).ok_or_else(|| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "42P01".to_owned(),
+                format!("Table '{}' not found", table_name),
+            )))
+        })?;
+
+        // 扫描找到所有行，然后删除
+        // TODO: WHERE 条件过滤（当前删除所有行）
+        let mut txn = self.engine.begin().map_err(|e| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
+            )))
+        })?;
+        let xid = txn.xid();
+
+        let mut scan = ferrisdb_transaction::HeapScan::new(&table);
+        let mut tids = Vec::new();
+        while let Ok(Some((tid, _hdr, _data))) = scan.next() {
+            tids.push(tid);
+        }
+
+        let mut deleted = 0usize;
+        for (i, tid) in tids.iter().enumerate() {
+            if table.delete(*tid, xid, i as u32).is_ok() {
+                deleted += 1;
+            }
+        }
+        txn.commit().map_err(|e| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
+            )))
+        })?;
+
+        Ok(vec![Response::Execution(Tag::new("DELETE").with_rows(deleted))])
+    }
+
+    /// 处理 UPDATE table SET col=val WHERE ...
+    async fn handle_update<'a>(&self, sql: &'a str) -> PgWireResult<Vec<Response<'a>>> {
+        // 简单解析: UPDATE table SET col1=val1, col2=val2 [WHERE ...]
+        let sql_upper = sql.to_uppercase();
+        let set_pos = sql_upper.find("SET").ok_or_else(|| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "42601".to_owned(),
+                "Invalid UPDATE syntax, expected SET".to_owned(),
+            )))
+        })?;
+
+        let table_name = sql[6..set_pos].trim().to_lowercase(); // skip "UPDATE "
+        let after_set = &sql[set_pos+3..];
+
+        let (set_clause, _where_clause) = if let Some(w) = after_set.to_uppercase().find("WHERE") {
+            (&after_set[..w], Some(&after_set[w+5..]))
+        } else {
+            (after_set.trim(), None)
+        };
+
+        let meta = self.engine.catalog().lookup_by_name(&table_name).ok_or_else(|| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "42P01".to_owned(),
+                format!("Table '{}' not found", table_name),
+            )))
+        })?;
+
+        let col_types: Vec<DataType> = meta.columns.iter().map(|c| c.data_type).collect();
+
+        // 解析 SET 子句: col1=val1, col2=val2
+        let mut updates: Vec<(String, String)> = Vec::new();
+        for assign in set_clause.split(',') {
+            let parts: Vec<&str> = assign.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                updates.push((parts[0].trim().to_lowercase(), parts[1].trim().trim_matches('\'').to_string()));
+            }
+        }
+
+        let table = self.engine.open_table(&table_name).map_err(|e| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
+            )))
+        })?;
+
+        let mut txn = self.engine.begin().map_err(|e| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
+            )))
+        })?;
+        let xid = txn.xid();
+
+        // 扫描所有行，修改后 update
+        let mut scan = ferrisdb_transaction::HeapScan::new(&table);
+        let mut rows_to_update = Vec::new();
+        while let Ok(Some((tid, _hdr, data))) = scan.next() {
+            let payload = if data.len() > 32 { &data[32..] } else { &data };
+            if let Some(mut vals) = ferrisdb_storage::row_codec::decode_row(&col_types, payload) {
+                // 应用 SET 更新
+                for (col_name, new_val) in &updates {
+                    if let Some(pos) = meta.columns.iter().position(|c| c.name == *col_name) {
+                        vals[pos] = parse_value(&col_types[pos], new_val);
+                    }
+                }
+                rows_to_update.push((tid, vals));
+            }
+        }
+
+        let mut updated = 0usize;
+        for (tid, vals) in &rows_to_update {
+            let encoded = encode_row(&col_types, vals);
+            if table.update(*tid, &encoded, xid, updated as u32).is_ok() {
+                updated += 1;
+            }
+        }
+        txn.commit().map_err(|e| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "XX000".to_owned(), format!("{}", e),
+            )))
+        })?;
+
+        Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(updated))])
+    }
+
+    /// 处理 DROP TABLE
+    async fn handle_drop_table<'a>(&self, sql: &'a str) -> PgWireResult<Vec<Response<'a>>> {
+        let table_name = sql[10..].trim().trim_end_matches(';').trim().to_lowercase();
+        self.engine.drop_table(&table_name).map_err(|e| {
+            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                "ERROR".to_owned(), "42P01".to_owned(), format!("{}", e),
+            )))
+        })?;
+        Ok(vec![Response::Execution(Tag::new("DROP TABLE"))])
+    }
+}
+
+/// 解析值字符串为 Value
+fn parse_value(dt: &DataType, s: &str) -> Value {
+    if s.to_uppercase() == "NULL" { return Value::Null; }
+    match dt {
+        DataType::Int32 => s.parse::<i32>().map(Value::Int32).unwrap_or(Value::Null),
+        DataType::Int64 => s.parse::<i64>().map(Value::Int64).unwrap_or(Value::Null),
+        DataType::Float64 => s.parse::<f64>().map(Value::Float64).unwrap_or(Value::Null),
+        DataType::Text => Value::Text(s.to_string()),
+        DataType::Boolean => Value::Boolean(s.to_uppercase() == "TRUE" || s == "1"),
+        DataType::Bytes => Value::Bytes(s.as_bytes().to_vec()),
     }
 }
 

@@ -9,6 +9,7 @@
 
 pub mod buffer;
 pub mod catalog;
+pub mod row_codec;
 pub mod control;
 pub mod index;
 pub mod lob;
@@ -23,6 +24,7 @@ pub use buffer::{BufferDesc, BufferPool, BufferPoolConfig, BufTable, LruQueue, P
 pub use index::{BTree, BTreeCursor, BTreeItem, BTreeKey, BTreePage, BTreePageType, BTreeStats, BTreeValue};
 pub use page::{PageHeader, PageId, HeapPage, ItemIdData, ItemIdFlags, ItemPointerData};
 pub use catalog::{SystemCatalog, RelationMeta, RelationType, ColumnDef, DataType};
+pub use row_codec::{Value, encode_row, decode_row};
 pub use control::{ControlFile, ControlFileData};
 pub use lob::{LobStore, LobHeader, LOB_CHUNK_SIZE};
 pub use parallel_scan::{ParallelScanCoordinator, parallel_scan};
